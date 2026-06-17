@@ -1,0 +1,367 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>台股監控 Dashboard</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --surface: #ffffff;
+      --text: #1d252d;
+      --muted: #66717d;
+      --line: #d9e0e7;
+      --up: #b42318;
+      --down: #067647;
+      --accent: #2563eb;
+      font-family: "Microsoft JhengHei", "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+    }
+    header {
+      padding: 24px clamp(16px, 4vw, 40px) 16px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+    header h1 {
+      margin: 0 0 8px;
+      font-size: clamp(24px, 3vw, 34px);
+      letter-spacing: 0;
+    }
+    header p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    main {
+      padding: 24px clamp(16px, 4vw, 40px) 40px;
+      display: grid;
+      gap: 20px;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(180px, 1fr));
+      gap: 14px;
+    }
+    .metric-card, .panel {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+    }
+    .metric-card { padding: 16px; }
+    .metric-top {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: start;
+    }
+    .metric-top h2, .panel-title h2 {
+      margin: 0;
+      font-size: 16px;
+      letter-spacing: 0;
+    }
+    .metric-top span, .panel-title span {
+      color: var(--muted);
+      font-size: 12px;
+      white-space: nowrap;
+    }
+    .metric-value {
+      margin-top: 16px;
+      font-size: 30px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+    .metric-change {
+      margin-top: 8px;
+      font-size: 14px;
+      font-weight: 700;
+      font-variant-numeric: tabular-nums;
+    }
+    .up { color: var(--up); }
+    .down { color: var(--down); }
+    .range-line {
+      margin-top: 14px;
+      display: grid;
+      grid-template-columns: auto 1fr auto;
+      gap: 8px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 11px;
+      font-variant-numeric: tabular-nums;
+    }
+    .range-line div {
+      height: 7px;
+      background: #e8edf3;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .range-line b {
+      display: block;
+      height: 100%;
+      min-width: 2px;
+      background: currentColor;
+      border-radius: inherit;
+    }
+    .panel {
+      padding: 18px;
+      overflow: hidden;
+    }
+    .panel-title {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 14px;
+    }
+    .bar-list {
+      display: grid;
+      gap: 12px;
+    }
+    .bar-row {
+      display: grid;
+      grid-template-columns: 140px 1fr 80px;
+      gap: 12px;
+      align-items: center;
+      font-size: 14px;
+    }
+    .bar-track {
+      height: 14px;
+      background: #e8edf3;
+      border-radius: 999px;
+      overflow: hidden;
+    }
+    .bar-track span {
+      display: block;
+      height: 100%;
+      min-width: 2px;
+      background: var(--accent);
+    }
+    .table-wrap { overflow-x: auto; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+      font-variant-numeric: tabular-nums;
+    }
+    th, td {
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--line);
+      text-align: right;
+      white-space: nowrap;
+    }
+    th:nth-child(1), th:nth-child(2),
+    td:nth-child(1), td:nth-child(2) {
+      text-align: left;
+    }
+    th { color: var(--muted); font-weight: 600; }
+    .meta {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.7;
+    }
+    @media (max-width: 1000px) {
+      .summary { grid-template-columns: repeat(2, minmax(180px, 1fr)); }
+    }
+    @media (max-width: 620px) {
+      .summary { grid-template-columns: 1fr; }
+      .bar-row { grid-template-columns: 1fr; }
+      .panel-title { display: block; }
+      .metric-value { font-size: 26px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>台股監控 Dashboard</h1>
+    <p>根據目前抓到的四大指數與 ETF 即時快照產生。資料來源：TWSE；行情時間：20260617 14:00:49；產生時間：2026-06-17 14:00:49</p>
+  </header>
+  <main>
+    <section class="summary">
+      
+            <section class="metric-card">
+              <div class="metric-top">
+                <h2>加權指數</h2>
+                <span>13:33:00</span>
+              </div>
+              <div class="metric-value">45,877.39</div>
+              <div class="metric-change up">
+                +68.20 / +0.15%
+              </div>
+              <div class="range-line">
+                <span>45,159.51</span>
+                <div><b class="up" style="width:8.4%"></b></div>
+                <span>45,877.39</span>
+              </div>
+            </section>
+            
+            <section class="metric-card">
+              <div class="metric-top">
+                <h2>櫃買指數</h2>
+                <span>13:33:00</span>
+              </div>
+              <div class="metric-value">433.34</div>
+              <div class="metric-change up">
+                +3.08 / +0.72%
+              </div>
+              <div class="range-line">
+                <span>426.55</span>
+                <div><b class="up" style="width:40.4%"></b></div>
+                <span>433.34</span>
+              </div>
+            </section>
+            
+            <section class="metric-card">
+              <div class="metric-top">
+                <h2>電子類指數</h2>
+                <span>13:33:00</span>
+              </div>
+              <div class="metric-value">2,955.76</div>
+              <div class="metric-change down">
+                -2.70 / -0.09%
+              </div>
+              <div class="range-line">
+                <span>2,910.82</span>
+                <div><b class="down" style="width:5.2%"></b></div>
+                <span>2,955.76</span>
+              </div>
+            </section>
+            
+            <section class="metric-card">
+              <div class="metric-top">
+                <h2>金融保險類指數</h2>
+                <span>13:33:00</span>
+              </div>
+              <div class="metric-value">3,193.94</div>
+              <div class="metric-change up">
+                +55.60 / +1.77%
+              </div>
+              <div class="range-line">
+                <span>3,120.10</span>
+                <div><b class="up" style="width:100.0%"></b></div>
+                <span>3,246.38</span>
+              </div>
+            </section>
+            
+    </section>
+    <section class="panel">
+      <div class="panel-title">
+        <h2>四大指數漲跌幅比較</h2>
+        <span>以目前快照相對昨收計算</span>
+      </div>
+      <div class="bar-list" id="changeBars"></div>
+    </section>
+    
+        <section class="panel">
+          <div class="panel-title">
+            <h2>市值前五大 ETF</h2>
+            <span>價格、漲跌幅、最高最低與成交量</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>代號</th>
+                  <th>名稱</th>
+                  <th>現價/估價</th>
+                  <th>漲跌</th>
+                  <th>漲跌幅</th>
+                  <th>最高</th>
+                  <th>最低</th>
+                  <th>量</th>
+                  <th>時間</th>
+                </tr>
+              </thead>
+              <tbody>
+            <tr>
+              <td>0050</td>
+              <td>元大台灣50</td>
+              <td>106.00</td>
+              <td class="up">+0.10</td>
+              <td class="up">+0.09%</td>
+              <td>106.00</td>
+              <td>104.50</td>
+              <td>75,134</td>
+              <td>13:30:00</td>
+            </tr>
+            
+            <tr>
+              <td>0056</td>
+              <td>元大高股息</td>
+              <td>51.95</td>
+              <td class="up">+0.40</td>
+              <td class="up">+0.78%</td>
+              <td>51.95</td>
+              <td>50.85</td>
+              <td>28,837</td>
+              <td>13:30:00</td>
+            </tr>
+            
+            <tr>
+              <td>00878</td>
+              <td>國泰永續高股息</td>
+              <td>33.27</td>
+              <td class="up">+0.36</td>
+              <td class="up">+1.09%</td>
+              <td>33.27</td>
+              <td>32.64</td>
+              <td>43,111</td>
+              <td>13:30:00</td>
+            </tr>
+            
+            <tr>
+              <td>00919</td>
+              <td>群益台灣精選高息</td>
+              <td>30.35</td>
+              <td class="up">+0.38</td>
+              <td class="up">+1.27%</td>
+              <td>30.52</td>
+              <td>29.84</td>
+              <td>137,985</td>
+              <td>13:30:00</td>
+            </tr>
+            
+            <tr>
+              <td>006208</td>
+              <td>富邦台50</td>
+              <td>246.30</td>
+              <td class="up">+0.95</td>
+              <td class="up">+0.39%</td>
+              <td>246.30</td>
+              <td>242.15</td>
+              <td>4,481</td>
+              <td>13:30:00</td>
+            </tr>
+            </tbody>
+            </table>
+          </div>
+        </section>
+        
+    <section class="panel meta">
+      <strong>資料與方法</strong><br>
+      指數與 ETF 資料由程式透過 `--source` 指定來源抓取；`auto` 模式會優先使用 TWSE，失敗時切換 Yahoo。漲跌與漲跌幅以目前價格相對昨收計算。若 ETF 即時成交價缺漏，程式會沿用既有邏輯，以買一/賣一中間價或昨收作為估價。
+    </section>
+  </main>
+  <script>
+    const DASHBOARD_DATA = {"indices": [{"name": "加權指數", "price": 45877.39, "previous_close": 45809.19, "open_price": 45685.27, "high": 45877.39, "low": 45159.51, "market_time": "13:33:00", "change": 68.19999999999709, "change_percent": 0.14887842373985893}, {"name": "櫃買指數", "price": 433.34, "previous_close": 430.26, "open_price": 428.97, "high": 433.34, "low": 426.55, "market_time": "13:33:00", "change": 3.079999999999984, "change_percent": 0.7158462325105713}, {"name": "電子類指數", "price": 2955.76, "previous_close": 2958.46, "open_price": 2950.66, "high": 2955.76, "low": 2910.82, "market_time": "13:33:00", "change": -2.699999999999818, "change_percent": -0.09126369800503702}, {"name": "金融保險類指數", "price": 3193.94, "previous_close": 3138.34, "open_price": 3136.71, "high": 3246.38, "low": 3120.1, "market_time": "13:33:00", "change": 55.59999999999991, "change_percent": 1.7716372349713512}], "etfs": [{"code": "0050", "name": "元大台灣50", "price": 106.0, "previous_close": 105.9, "bid": 106.0, "ask": 106.05, "high": 106.0, "low": 104.5, "volume": 75134, "market_time": "13:30:00", "change": 0.09999999999999432, "change_percent": 0.09442870632671795, "display_price": 106.0}, {"code": "0056", "name": "元大高股息", "price": 51.95, "previous_close": 51.55, "bid": 51.9, "ask": 51.95, "high": 51.95, "low": 50.85, "volume": 28837, "market_time": "13:30:00", "change": 0.4000000000000057, "change_percent": 0.775945683802145, "display_price": 51.95}, {"code": "00878", "name": "國泰永續高股息", "price": 33.27, "previous_close": 32.91, "bid": 33.27, "ask": 33.28, "high": 33.27, "low": 32.64, "volume": 43111, "market_time": "13:30:00", "change": 0.36000000000000654, "change_percent": 1.0938924339106855, "display_price": 33.27}, {"code": "00919", "name": "群益台灣精選高息", "price": 30.35, "previous_close": 29.97, "bid": 30.35, "ask": 30.36, "high": 30.52, "low": 29.84, "volume": 137985, "market_time": "13:30:00", "change": 0.38000000000000256, "change_percent": 1.267934601267943, "display_price": 30.35}, {"code": "006208", "name": "富邦台50", "price": 246.3, "previous_close": 245.35, "bid": 246.3, "ask": 246.4, "high": 246.3, "low": 242.15, "volume": 4481, "market_time": "13:30:00", "change": 0.950000000000017, "change_percent": 0.38720195638883925, "display_price": 246.3}], "apiTime": "20260617 14:00:49", "dataSource": "TWSE", "generatedAt": "2026-06-17 14:00:49"};
+    const maxAbs = Math.max(1, ...DASHBOARD_DATA.indices.map(item => Math.abs(item.change_percent || 0)));
+    const bars = document.getElementById("changeBars");
+    DASHBOARD_DATA.indices.forEach(item => {
+      const row = document.createElement("div");
+      row.className = "bar-row";
+      const pct = item.change_percent || 0;
+      const width = Math.min(100, Math.abs(pct) / maxAbs * 100);
+      row.innerHTML = `
+        <strong>${item.name}</strong>
+        <div class="bar-track"><span style="width:${width}%; background:${pct >= 0 ? "var(--up)" : "var(--down)"}"></span></div>
+        <span class="${pct >= 0 ? "up" : "down"}">${pct >= 0 ? "+" : ""}${pct.toFixed(2)}%</span>
+      `;
+      bars.appendChild(row);
+    });
+  </script>
+</body>
+</html>

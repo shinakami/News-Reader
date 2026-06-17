@@ -13,6 +13,7 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
+from news_reader.dashboard import main as dashboard_main  # noqa: E402
 from news_reader.news import main as news_main  # noqa: E402
 from news_reader.stock_monitor import main as stock_main  # noqa: E402
 
@@ -24,9 +25,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["news", "stocks"],
+        choices=["news", "stocks", "dashboard"],
         default="news",
-        help="要執行的功能：news 抓新聞；stocks 監控台股。預設 news。",
+        help="要執行的功能：news 抓新聞；stocks 監控台股；dashboard 產生 HTML Dashboard。預設 news。",
     )
     parser.add_argument("args", nargs=argparse.REMAINDER, help="傳給子功能的參數。")
     return parser.parse_args()
@@ -36,6 +37,8 @@ def main() -> int:
     args = parse_args()
     if args.command == "stocks":
         return stock_main(args.args)
+    if args.command == "dashboard":
+        return dashboard_main(args.args)
     return news_main(args.args)
 
 

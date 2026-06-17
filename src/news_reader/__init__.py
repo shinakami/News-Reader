@@ -1,3 +1,3 @@
 """News Reader package."""
 
-__all__ = ["news", "stock_monitor"]
+__all__ = ["dashboard", "news", "stock_monitor"]
