@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import contextlib
+import http.client
 import io
 import json
 import ssl
@@ -34,6 +35,21 @@ TOP_ETFS = {
     "tse_00878.tw": "國泰永續高股息",
     "tse_00919.tw": "群益台灣精選高息",
     "tse_006208.tw": "富邦台50",
+}
+
+YAHOO_INDICES = {
+    "^TWII": "加權指數",
+    "^TWOII": "櫃買指數",
+    "^TELI": "電子類指數",
+    "^TFNI": "金融保險類指數",
+}
+
+YAHOO_ETFS = {
+    "0050.TW": "元大台灣50",
+    "0056.TW": "元大高股息",
+    "00878.TW": "國泰永續高股息",
+    "00919.TW": "群益台灣精選高息",
+    "006208.TW": "富邦台50",
 }
 
 
@@ -230,29 +246,143 @@ def make_context(verify_ssl: bool) -> ssl.SSLContext:
     return ssl._create_unverified_context()
 
 
-def fetch_quotes(timeout: int, verify_ssl: bool) -> tuple[list[IndexQuote], str]:
-    symbols = "|".join(INDICES)
+def build_twse_request(symbols: str) -> urllib.request.Request:
     params = urllib.parse.urlencode({"ex_ch": symbols, "json": "1", "delay": "0"})
     url = f"{TWSE_API_URL}?{params}"
-    request = urllib.request.Request(
+    return urllib.request.Request(
         url,
         headers={
             "User-Agent": "News Reader Stock Monitor/1.0",
             "Referer": "https://mis.twse.com.tw/stock/index.jsp",
+            "Connection": "close",
         },
     )
 
-    try:
-        with urllib.request.urlopen(
-            request, timeout=timeout, context=make_context(verify_ssl)
-        ) as response:
-            payload = response.read().decode("utf-8-sig")
-    except urllib.error.URLError as exc:
-        if verify_ssl and "CERTIFICATE_VERIFY_FAILED" in str(exc):
-            return fetch_quotes(timeout, verify_ssl=False)
-        raise
 
-    data = json.loads(payload.strip())
+def fetch_twse_json(symbols: str, timeout: int, verify_ssl: bool, retries: int) -> dict:
+    last_error: Exception | None = None
+    attempts = max(0, retries) + 1
+
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(
+                build_twse_request(symbols),
+                timeout=timeout,
+                context=make_context(verify_ssl),
+            ) as response:
+                payload = response.read().decode("utf-8-sig")
+            return json.loads(payload.strip())
+        except urllib.error.URLError as exc:
+            if verify_ssl and "CERTIFICATE_VERIFY_FAILED" in str(exc):
+                return fetch_twse_json(symbols, timeout, verify_ssl=False, retries=retries)
+            last_error = exc
+        except (ConnectionError, TimeoutError, http.client.RemoteDisconnected) as exc:
+            last_error = exc
+        except json.JSONDecodeError:
+            raise
+
+        if attempt < attempts - 1:
+            time.sleep(0.5 * (attempt + 1))
+
+    raise RuntimeError(f"TWSE API 連線失敗，已重試 {retries} 次：{last_error}")
+
+
+def fetch_yahoo_chart(symbol: str, timeout: int, retries: int) -> dict:
+    encoded = urllib.parse.quote(symbol, safe="")
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?range=1d&interval=1m"
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Connection": "close",
+        },
+    )
+    last_error: Exception | None = None
+    attempts = max(0, retries) + 1
+
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            result = data.get("chart", {}).get("result") or []
+            if not result:
+                raise RuntimeError(data.get("chart", {}).get("error") or "Yahoo API returned no result")
+            return result[0]
+        except (OSError, json.JSONDecodeError, RuntimeError) as exc:
+            last_error = exc
+        if attempt < attempts - 1:
+            time.sleep(0.5 * (attempt + 1))
+
+    raise RuntimeError(f"Yahoo API 連線失敗，已重試 {retries} 次：{last_error}")
+
+
+def yahoo_time(meta: dict) -> str:
+    timestamp = meta.get("regularMarketTime")
+    if not timestamp:
+        return "--"
+    try:
+        return datetime.fromtimestamp(timestamp).strftime("%H:%M:%S")
+    except (OSError, TypeError, ValueError):
+        return "--"
+
+
+def fetch_yahoo_quotes(timeout: int, retries: int) -> tuple[list[IndexQuote], str]:
+    quotes = []
+    api_time = ""
+    for symbol, name in YAHOO_INDICES.items():
+        result = fetch_yahoo_chart(symbol, timeout, retries)
+        meta = result.get("meta", {})
+        market_time = yahoo_time(meta)
+        api_time = market_time or api_time
+        quotes.append(
+            IndexQuote(
+                name=name,
+                price=to_float(str(meta.get("regularMarketPrice", ""))),
+                previous_close=to_float(str(meta.get("previousClose", ""))),
+                open_price=to_float(str(meta.get("regularMarketOpen", ""))),
+                high=to_float(str(meta.get("regularMarketDayHigh", ""))),
+                low=to_float(str(meta.get("regularMarketDayLow", ""))),
+                market_time=market_time,
+            )
+        )
+    return quotes, f"Yahoo {api_time}".strip()
+
+
+def fetch_yahoo_etf_quotes(timeout: int, retries: int) -> list[EtfQuote]:
+    quotes = []
+    for symbol, name in YAHOO_ETFS.items():
+        result = fetch_yahoo_chart(symbol, timeout, retries)
+        meta = result.get("meta", {})
+        code = symbol.split(".", 1)[0]
+        quotes.append(
+            EtfQuote(
+                code=code,
+                name=name,
+                price=to_float(str(meta.get("regularMarketPrice", ""))),
+                previous_close=to_float(str(meta.get("previousClose", ""))),
+                bid=None,
+                ask=None,
+                high=to_float(str(meta.get("regularMarketDayHigh", ""))),
+                low=to_float(str(meta.get("regularMarketDayLow", ""))),
+                volume=to_int(str(meta.get("regularMarketVolume", ""))),
+                market_time=yahoo_time(meta),
+            )
+        )
+    return quotes
+
+
+def fetch_quotes(
+    timeout: int,
+    verify_ssl: bool,
+    retries: int,
+    source: str,
+) -> tuple[list[IndexQuote], str, str]:
+    if source == "yahoo":
+        quotes, api_time = fetch_yahoo_quotes(timeout, retries)
+        return quotes, api_time, "Yahoo"
+
+    data = fetch_twse_json("|".join(INDICES), timeout, verify_ssl, retries)
+
     if data.get("rtcode") != "0000":
         raise RuntimeError(data.get("rtmessage", "TWSE API returned an error"))
 
@@ -275,32 +405,20 @@ def fetch_quotes(timeout: int, verify_ssl: bool) -> tuple[list[IndexQuote], str]
     ordered = sorted(quotes, key=lambda quote: list(INDICES.values()).index(quote.name))
     query_time = data.get("queryTime", {})
     api_time = f"{query_time.get('sysDate', '')} {query_time.get('sysTime', '')}".strip()
-    return ordered, api_time
+    return ordered, api_time, "TWSE"
 
 
-def fetch_etf_quotes(timeout: int, verify_ssl: bool) -> list[EtfQuote]:
-    symbols = "|".join(TOP_ETFS)
-    params = urllib.parse.urlencode({"ex_ch": symbols, "json": "1", "delay": "0"})
-    url = f"{TWSE_API_URL}?{params}"
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": "News Reader Stock Monitor/1.0",
-            "Referer": "https://mis.twse.com.tw/stock/index.jsp",
-        },
-    )
+def fetch_etf_quotes(
+    timeout: int,
+    verify_ssl: bool,
+    retries: int,
+    source: str,
+) -> list[EtfQuote]:
+    if source == "yahoo":
+        return fetch_yahoo_etf_quotes(timeout, retries)
 
-    try:
-        with urllib.request.urlopen(
-            request, timeout=timeout, context=make_context(verify_ssl)
-        ) as response:
-            payload = response.read().decode("utf-8-sig")
-    except urllib.error.URLError as exc:
-        if verify_ssl and "CERTIFICATE_VERIFY_FAILED" in str(exc):
-            return fetch_etf_quotes(timeout, verify_ssl=False)
-        raise
+    data = fetch_twse_json("|".join(TOP_ETFS), timeout, verify_ssl, retries)
 
-    data = json.loads(payload.strip())
     if data.get("rtcode") != "0000":
         raise RuntimeError(data.get("rtmessage", "TWSE API returned an error"))
 
@@ -325,6 +443,42 @@ def fetch_etf_quotes(timeout: int, verify_ssl: bool) -> list[EtfQuote]:
 
     order = list(TOP_ETFS)
     return sorted(quotes, key=lambda quote: order.index(f"tse_{quote.code}.tw"))
+
+
+def fetch_market_data(
+    timeout: int,
+    verify_ssl: bool,
+    retries: int,
+    source: str,
+    include_etfs: bool,
+) -> tuple[list[IndexQuote], str, str, list[EtfQuote] | None]:
+    actual_source = source
+    if source == "auto":
+        try:
+            quotes, api_time, actual_source = fetch_quotes(
+                timeout, verify_ssl, retries, "twse"
+            )
+        except RuntimeError:
+            quotes, api_time, actual_source = fetch_quotes(
+                timeout, verify_ssl, retries, "yahoo"
+            )
+    else:
+        quotes, api_time, actual_source = fetch_quotes(
+            timeout, verify_ssl, retries, source
+        )
+
+    etfs = None
+    if include_etfs:
+        try:
+            etfs = fetch_etf_quotes(timeout, verify_ssl, retries, actual_source.lower())
+        except RuntimeError:
+            if actual_source.lower() != "yahoo":
+                etfs = fetch_etf_quotes(timeout, verify_ssl, retries, "yahoo")
+                actual_source = f"{actual_source} / ETF: Yahoo"
+            else:
+                raise
+
+    return quotes, api_time, actual_source, etfs
 
 
 def restore_cursor() -> None:
@@ -400,10 +554,12 @@ def print_quotes(
     chart_width: int,
     chart_height: int,
     etfs: list[EtfQuote] | None,
+    data_source: str,
 ) -> dict[str, float | None]:
     print("台股四大指數動態監控")
     print(f"本機時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"交易所時間：{api_time or '--'}")
+    print(f"資料來源：{data_source}")
     print(f"更新頻率：每 {interval} 秒")
     print(f"SSL 驗證：{'開啟' if verify_ssl else '自動備援'}")
     print("按 Ctrl+C 停止\n")
@@ -436,6 +592,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="時刻監控台股四大指數動態。")
     parser.add_argument("-i", "--interval", type=int, default=10, help="更新間隔秒數，預設 10。")
     parser.add_argument("--timeout", type=int, default=15, help="網路逾時秒數，預設 15。")
+    parser.add_argument("--retries", type=int, default=2, help="連線失敗時重試次數，預設 2。")
+    parser.add_argument(
+        "--source",
+        choices=["auto", "twse", "yahoo"],
+        default="auto",
+        help="資料來源，預設 auto；TWSE 失敗時自動切 Yahoo。",
+    )
     parser.add_argument("--no-clear", action="store_true", help="不要清除畫面，保留每次更新紀錄。")
     parser.add_argument("--once", action="store_true", help="只抓取一次後結束。")
     parser.add_argument("--history", type=int, default=60, help="圖表保留的資料點數，預設 60。")
@@ -454,6 +617,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = parse_args(argv)
     interval = max(1, args.interval)
+    retries = max(0, args.retries)
     max_history = max(2, args.history)
     chart_width = max(10, args.chart_width)
     chart_height = max(4, args.chart_height)
@@ -465,8 +629,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         while True:
             try:
-                quotes, api_time = fetch_quotes(args.timeout, args.verify_ssl)
-                etfs = None if args.no_etf else fetch_etf_quotes(args.timeout, args.verify_ssl)
+                quotes, api_time, data_source, etfs = fetch_market_data(
+                    args.timeout,
+                    args.verify_ssl,
+                    retries,
+                    args.source,
+                    not args.no_etf,
+                )
                 history = add_history(history, quotes, max_history)
                 if args.no_clear:
                     previous_prices = print_quotes(
@@ -480,6 +649,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         chart_width,
                         chart_height,
                         etfs,
+                        data_source,
                     )
                 else:
                     frame, next_prices = render_output(
@@ -494,6 +664,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         chart_width,
                         chart_height,
                         etfs,
+                        data_source,
                     )
                     previous_prices = next_prices
                     previous_line_count = draw_frame(frame, previous_line_count)

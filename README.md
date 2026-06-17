@@ -99,6 +99,8 @@ python .\main.py stocks [options]
 |---|---:|---|
 | `-i`, `--interval` | `10` | 每幾秒更新一次指數與 ETF 資料。 |
 | `--timeout` | `15` | 網路請求逾時秒數。 |
+| `--retries` | `2` | 連線失敗時自動重試幾次，可降低 TWSE 短暫斷線造成的錯誤。 |
+| `--source` | `auto` | 資料來源，可用 `auto`、`twse`、`yahoo`。`auto` 會先用 TWSE，失敗時切 Yahoo。 |
 | `--no-clear` | 關閉 | 不使用原地更新，保留每次更新紀錄。 |
 | `--once` | 關閉 | 只抓取一次快照後結束。 |
 | `--history` | `60` | 每個指數圖表保留幾個歷史資料點。 |
@@ -109,6 +111,20 @@ python .\main.py stocks [options]
 | `--verify-ssl` | 關閉 | 強制驗證 TWSE SSL 憑證；若本機憑證鏈不完整，可能導致抓取失敗。 |
 
 監控模式預設使用原地更新，減少終端閃屏。若想保留每次更新紀錄，可加上 `--no-clear`。
+
+若出現 `Remote end closed connection without response`，代表 TWSE 伺服器暫時中斷連線。可提高更新間隔或重試次數：
+
+```powershell
+python .\main.py stocks -i 15 --retries 4
+```
+
+也可直接使用 Yahoo 備援資料源：
+
+```powershell
+python .\main.py stocks --source yahoo
+```
+
+`auto` 模式會優先使用 TWSE；若 TWSE 連線失敗，會自動切換到 Yahoo，畫面會顯示目前資料來源。
 
 ## 股票監控常用參數
 
