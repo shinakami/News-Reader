@@ -345,12 +345,13 @@ class StockDynamicApp:
         self.result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.loading = False
         self.closed = False
+        self.applying_theme = False
         self.theme_name = "day"
         self.theme = THEMES[self.theme_name]
 
         self.root.title("Stock Dynamic")
         self.root.geometry("1240x840")
-        self.root.minsize(1040, 720)
+        self.root.minsize(760, 620)
         self.root.configure(bg=self.theme["bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -358,8 +359,11 @@ class StockDynamicApp:
         self.source_text = tk.StringVar(value=f"來源：{source}")
         self.theme_button_text = tk.StringVar(value=self.theme["next_label"])
         self.style = ttk.Style()
+        self.card_widgets: list[ttk.Frame] = []
+        self.current_layout: tuple[int, bool] | None = None
         self.build_ui()
         self.apply_theme()
+        self.root.bind("<Configure>", self.on_root_resize)
         self.refresh()
         self.root.after(200, self.process_results)
 
@@ -411,6 +415,7 @@ class StockDynamicApp:
         for idx, name in enumerate(INDICES.values()):
             frame = ttk.Frame(self.card_frame, style="Card.TFrame", padding=16)
             frame.grid(row=0, column=idx, sticky="nsew", padx=(0 if idx == 0 else 10, 0))
+            self.card_widgets.append(frame)
             accent = tk.Frame(frame, height=4, bg=CHART_COLORS.get(name, self.theme["accent"]))
             accent.pack(fill="x", side="top", pady=(0, 12))
             ttk.Label(
@@ -438,44 +443,82 @@ class StockDynamicApp:
             self.cards[name] = {"value": value, "change": change, "time": time_label, "accent": accent}
             self.card_frame.columnconfigure(idx, weight=1, uniform="cards")
 
-        body = ttk.Frame(self.root, style="TFrame")
-        body.pack(fill="both", expand=True, padx=16, pady=(4, 16))
-        body.columnconfigure(0, weight=3)
-        body.columnconfigure(1, weight=2)
-        body.rowconfigure(0, weight=1)
+        self.body = ttk.Frame(self.root, style="TFrame")
+        self.body.pack(fill="both", expand=True, padx=16, pady=(4, 16))
+        self.body.columnconfigure(0, weight=3)
+        self.body.columnconfigure(1, weight=2)
+        self.body.rowconfigure(0, weight=1)
 
-        chart_panel = ttk.Frame(body, style="Card.TFrame", padding=16)
-        chart_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        self.main_pane = tk.PanedWindow(
+            self.body,
+            orient="horizontal",
+            sashwidth=8,
+            sashrelief="raised",
+            showhandle=True,
+            bd=0,
+            opaqueresize=True,
+        )
+        self.main_pane.grid(row=0, column=0, columnspan=2, sticky="nsew")
+
+        self.chart_panel = ttk.Frame(self.main_pane, style="Card.TFrame", padding=16)
         ttk.Label(
-            chart_panel,
+            self.chart_panel,
             text="四大指數曲線圖",
             style="CardTitle.TLabel",
             font=("Microsoft JhengHei UI", 13, "bold"),
         ).pack(anchor="w")
-        self.chart_canvas = tk.Canvas(
-            chart_panel,
-            bg=self.theme["surface"],
-            highlightthickness=0,
-            height=420,
+        self.chart_pane = tk.PanedWindow(
+            self.chart_panel,
+            orient="vertical",
+            sashwidth=7,
+            sashrelief="raised",
+            showhandle=True,
+            bd=0,
+            opaqueresize=True,
         )
-        self.chart_canvas.pack(fill="both", expand=True, pady=(8, 0))
-        self.chart_canvas.bind("<Configure>", lambda _event: self.draw_chart())
+        self.chart_pane.pack(fill="both", expand=True, pady=(8, 0))
+        self.chart_rows: list[tk.PanedWindow] = []
+        self.index_canvases: dict[str, tk.Canvas] = {}
+        index_names = list(INDICES.values())
+        for row_index in range(2):
+            row_pane = tk.PanedWindow(
+                self.chart_pane,
+                orient="horizontal",
+                sashwidth=7,
+                sashrelief="raised",
+                showhandle=True,
+                bd=0,
+                opaqueresize=True,
+            )
+            self.chart_rows.append(row_pane)
+            self.chart_pane.add(row_pane, stretch="always", minsize=150)
+            for col_index in range(2):
+                name = index_names[row_index * 2 + col_index]
+                canvas = tk.Canvas(
+                    row_pane,
+                    bg=self.theme["surface"],
+                    highlightthickness=0,
+                    height=200,
+                    width=280,
+                )
+                self.index_canvases[name] = canvas
+                row_pane.add(canvas, stretch="always", minsize=180)
+                canvas.bind("<Configure>", lambda _event, n=name: self.draw_one_index_chart(n))
 
-        right_panel = ttk.Frame(body, style="TFrame")
-        right_panel.grid(row=0, column=1, sticky="nsew")
-        right_panel.rowconfigure(0, weight=1)
-        right_panel.columnconfigure(0, weight=1)
+        self.right_panel = ttk.Frame(self.main_pane, style="TFrame")
+        self.right_panel.rowconfigure(0, weight=1)
+        self.right_panel.columnconfigure(0, weight=1)
 
-        etf_panel = ttk.Frame(right_panel, style="Card.TFrame", padding=16)
-        etf_panel.grid(row=0, column=0, sticky="nsew")
+        self.etf_panel = ttk.Frame(self.right_panel, style="Card.TFrame", padding=16)
+        self.etf_panel.grid(row=0, column=0, sticky="nsew")
         ttk.Label(
-            etf_panel,
+            self.etf_panel,
             text="台灣上市 ETF",
             style="CardTitle.TLabel",
             font=("Microsoft JhengHei UI", 13, "bold"),
         ).pack(anchor="w")
         columns = ("code", "name", "market_value", "price", "change", "percent", "volume", "time", "source")
-        table_frame = ttk.Frame(etf_panel, style="Card.TFrame")
+        table_frame = ttk.Frame(self.etf_panel, style="Card.TFrame")
         table_frame.pack(fill="both", expand=True, pady=(8, 0))
         self.etf_tree = ttk.Treeview(
             table_frame,
@@ -484,7 +527,8 @@ class StockDynamicApp:
             height=16,
         )
         etf_scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.etf_tree.yview)
-        self.etf_tree.configure(yscrollcommand=etf_scrollbar.set)
+        etf_xscrollbar = ttk.Scrollbar(table_frame, orient="horizontal", command=self.etf_tree.xview)
+        self.etf_tree.configure(yscrollcommand=etf_scrollbar.set, xscrollcommand=etf_xscrollbar.set)
         self.etf_tree.tag_configure("up", foreground=self.theme["up"])
         self.etf_tree.tag_configure("down", foreground=self.theme["down"])
         headings = {
@@ -514,9 +558,70 @@ class StockDynamicApp:
             self.etf_tree.column(column, width=widths[column], anchor="e")
         self.etf_tree.column("code", anchor="w")
         self.etf_tree.column("name", anchor="w")
-        self.etf_tree.pack(side="left", fill="both", expand=True)
-        etf_scrollbar.pack(side="right", fill="y")
+        self.etf_tree.grid(row=0, column=0, sticky="nsew")
+        etf_scrollbar.grid(row=0, column=1, sticky="ns")
+        etf_xscrollbar.grid(row=1, column=0, sticky="ew")
+        table_frame.columnconfigure(0, weight=1)
+        table_frame.rowconfigure(0, weight=1)
         self.etf_tree.bind("<Double-1>", self.open_selected_etf)
+        self.main_pane.add(self.chart_panel, stretch="always", minsize=360)
+        self.main_pane.add(self.right_panel, stretch="always", minsize=360)
+        self.layout_for_width(self.root.winfo_width() or 1240)
+
+    def on_root_resize(self, event: tk.Event) -> None:
+        if event.widget is self.root and not self.applying_theme:
+            self.layout_for_width(event.width)
+
+    def layout_for_width(self, width: int, force: bool = False) -> None:
+        card_columns = 4
+        if width < 620:
+            card_columns = 1
+        elif width < 980:
+            card_columns = 2
+
+        stacked_body = width < 1120
+        layout_key = (card_columns, stacked_body)
+        if self.current_layout == layout_key and not force:
+            return
+        self.current_layout = layout_key
+
+        for column in range(4):
+            self.card_frame.columnconfigure(column, weight=0)
+        for row in range(4):
+            self.card_frame.rowconfigure(row, weight=0)
+        for idx, frame in enumerate(self.card_widgets):
+            frame.grid_forget()
+            row = idx // card_columns
+            column = idx % card_columns
+            padx = (0 if column == 0 else 10, 0)
+            pady = (0 if row == 0 else 10, 0)
+            frame.grid(row=row, column=column, sticky="nsew", padx=padx, pady=pady)
+        for column in range(card_columns):
+            self.card_frame.columnconfigure(column, weight=1, uniform="cards")
+        for row in range((len(self.card_widgets) + card_columns - 1) // card_columns):
+            self.card_frame.rowconfigure(row, weight=1)
+
+        for index in range(2):
+            self.body.columnconfigure(index, weight=0)
+            self.body.rowconfigure(index, weight=0)
+        self.body.grid_columnconfigure(0, minsize=0)
+        self.body.grid_columnconfigure(1, minsize=0)
+        self.body.grid_rowconfigure(0, minsize=0)
+        self.body.grid_rowconfigure(1, minsize=0)
+
+        if stacked_body:
+            self.body.columnconfigure(0, weight=1)
+            self.body.rowconfigure(0, weight=3)
+            self.main_pane.configure(orient="vertical")
+            self.main_pane.grid(row=0, column=0, sticky="nsew")
+        else:
+            self.body.columnconfigure(0, weight=3)
+            self.body.columnconfigure(1, weight=2)
+            self.body.rowconfigure(0, weight=1)
+            self.main_pane.configure(orient="horizontal")
+            self.main_pane.grid(row=0, column=0, columnspan=2, sticky="nsew")
+
+        self.draw_chart()
 
     def apply_theme(self) -> None:
         theme = self.theme
@@ -553,7 +658,10 @@ class StockDynamicApp:
             foreground=[("selected", theme["text"])],
         )
 
-        self.chart_canvas.configure(bg=theme["surface"])
+        for pane in [self.main_pane, self.chart_pane, *self.chart_rows]:
+            pane.configure(bg=theme["line"])
+        for canvas in self.index_canvases.values():
+            canvas.configure(bg=theme["surface"])
         self.etf_tree.tag_configure("up", foreground=theme["up"])
         self.etf_tree.tag_configure("down", foreground=theme["down"])
         for name, labels in self.cards.items():
@@ -563,7 +671,12 @@ class StockDynamicApp:
     def toggle_theme(self) -> None:
         self.theme_name = "night" if self.theme_name == "day" else "day"
         self.theme = THEMES[self.theme_name]
-        self.apply_theme()
+        self.applying_theme = True
+        try:
+            self.apply_theme()
+        finally:
+            self.applying_theme = False
+        self.root.after_idle(lambda: self.layout_for_width(self.root.winfo_width(), force=True))
 
     def close(self) -> None:
         self.closed = True
@@ -690,24 +803,17 @@ class StockDynamicApp:
         )
 
     def draw_chart(self) -> None:
-        canvas = self.chart_canvas
-        theme = self.theme
-        canvas.delete("all")
-        width = max(canvas.winfo_width(), 400)
-        height = max(canvas.winfo_height(), 280)
-        gap = 14
-        outer = 8
-        panel_w = (width - outer * 2 - gap) / 2
-        panel_h = (height - outer * 2 - gap) / 2
+        for name in INDICES.values():
+            self.draw_one_index_chart(name)
 
-        for index, name in enumerate(INDICES.values()):
-            col = index % 2
-            row = index // 2
-            x0 = outer + col * (panel_w + gap)
-            y0 = outer + row * (panel_h + gap)
-            x1 = x0 + panel_w
-            y1 = y0 + panel_h
-            self.draw_index_panel(canvas, name, x0, y0, x1, y1)
+    def draw_one_index_chart(self, name: str) -> None:
+        canvas = self.index_canvases.get(name)
+        if not canvas:
+            return
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 220)
+        height = max(canvas.winfo_height(), 160)
+        self.draw_index_panel(canvas, name, 0, 0, width, height)
 
     def draw_index_panel(
         self,
@@ -719,6 +825,11 @@ class StockDynamicApp:
         y1: float,
     ) -> None:
         theme = self.theme
+        margin = 4
+        x0 += margin
+        y0 += margin
+        x1 -= margin
+        y1 -= margin
         points = self.history.get(name, [])
         previous_close = self.index_previous_close.get(name)
         latest_value = points[-1] if points else None
@@ -849,11 +960,12 @@ class EtfDetailWindow:
         self.queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.loading = False
         self.closed = False
+        self.detail_layout_stacked: bool | None = None
 
         self.window = tk.Toplevel(parent)
         self.window.title(f"{initial.code} {initial.name}")
         self.window.geometry("760x560")
-        self.window.minsize(680, 500)
+        self.window.minsize(520, 420)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
 
         self.title_text = tk.StringVar(value=f"{initial.code}  {initial.name}")
@@ -864,6 +976,7 @@ class EtfDetailWindow:
 
         self.build_ui()
         self.apply_theme()
+        self.window.bind("<Configure>", self.on_resize)
         self.update_quote(initial)
         self.refresh()
         self.window.after(200, self.process_results)
@@ -872,20 +985,20 @@ class EtfDetailWindow:
         self.frame = tk.Frame(self.window, padx=18, pady=16)
         self.frame.pack(fill="both", expand=True)
 
-        top = tk.Frame(self.frame)
-        top.pack(fill="x")
-        left = tk.Frame(top)
-        left.pack(side="left", fill="x", expand=True)
-        self.title_label = tk.Label(left, textvariable=self.title_text, font=("Microsoft JhengHei UI", 17, "bold"), anchor="w")
+        self.top_frame = tk.Frame(self.frame)
+        self.top_frame.pack(fill="x")
+        self.left_frame = tk.Frame(self.top_frame)
+        self.left_frame.grid(row=0, column=0, sticky="nsew")
+        self.title_label = tk.Label(self.left_frame, textvariable=self.title_text, font=("Microsoft JhengHei UI", 17, "bold"), anchor="w")
         self.title_label.pack(anchor="w")
-        self.source_label = tk.Label(left, textvariable=self.source_text, font=("Microsoft JhengHei UI", 10), anchor="w")
+        self.source_label = tk.Label(self.left_frame, textvariable=self.source_text, font=("Microsoft JhengHei UI", 10), anchor="w")
         self.source_label.pack(anchor="w", pady=(4, 0))
 
-        right = tk.Frame(top)
-        right.pack(side="right")
-        self.price_label = tk.Label(right, textvariable=self.price_text, font=("Segoe UI", 28, "bold"), anchor="e")
+        self.right_frame = tk.Frame(self.top_frame)
+        self.right_frame.grid(row=0, column=1, sticky="ne")
+        self.price_label = tk.Label(self.right_frame, textvariable=self.price_text, font=("Segoe UI", 28, "bold"), anchor="e")
         self.price_label.pack(anchor="e")
-        self.change_label = tk.Label(right, textvariable=self.change_text, font=("Segoe UI", 12, "bold"), anchor="e")
+        self.change_label = tk.Label(self.right_frame, textvariable=self.change_text, font=("Segoe UI", 12, "bold"), anchor="e")
         self.change_label.pack(anchor="e")
 
         self.detail_label = tk.Label(
@@ -900,11 +1013,46 @@ class EtfDetailWindow:
         self.canvas = tk.Canvas(self.frame, height=310, highlightthickness=0)
         self.canvas.pack(fill="both", expand=True)
         self.canvas.bind("<Configure>", lambda _event: self.draw_chart())
+        self.top_frame.columnconfigure(0, weight=1)
+
+    def on_resize(self, event: tk.Event) -> None:
+        if event.widget is self.window:
+            self.layout_for_width(event.width)
+
+    def layout_for_width(self, width: int) -> None:
+        stacked = width < 620
+        if self.detail_layout_stacked == stacked:
+            return
+        self.detail_layout_stacked = stacked
+        self.left_frame.grid_forget()
+        self.right_frame.grid_forget()
+        if stacked:
+            self.left_frame.grid(row=0, column=0, sticky="ew")
+            self.right_frame.grid(row=1, column=0, sticky="w", pady=(10, 0))
+            self.price_label.configure(anchor="w")
+            self.change_label.configure(anchor="w")
+        else:
+            self.left_frame.grid(row=0, column=0, sticky="nsew")
+            self.right_frame.grid(row=0, column=1, sticky="ne")
+            self.price_label.configure(anchor="e")
+            self.change_label.configure(anchor="e")
+        self.top_frame.columnconfigure(0, weight=1)
+        self.draw_chart()
 
     def apply_theme(self) -> None:
         theme = self.theme_getter()
         self.window.configure(bg=theme["bg"])
-        for widget in [self.frame, self.title_label, self.source_label, self.price_label, self.change_label, self.detail_label]:
+        for widget in [
+            self.frame,
+            self.top_frame,
+            self.left_frame,
+            self.right_frame,
+            self.title_label,
+            self.source_label,
+            self.price_label,
+            self.change_label,
+            self.detail_label,
+        ]:
             widget.configure(bg=theme["surface"])
         self.frame.configure(bg=theme["surface"])
         self.title_label.configure(fg=theme["text"])
