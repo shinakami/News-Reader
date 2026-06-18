@@ -7,6 +7,7 @@
 - 顯示四大指數終端走勢圖
 - 顯示市值前五大 ETF 即時股價資訊
 - 用目前抓到的行情快照產生 HTML Dashboard
+- 啟動股票動態視窗介面，查看價格與曲線圖
 
 ## 專案結構
 
@@ -18,15 +19,18 @@ News Reader/
 ├─ .gitignore
 ├─ README.md
 ├─ news_reader.py
+├─ stock_dynamic.py
 ├─ stock_index_monitor.py
 ├─ run_news_reader.bat
 ├─ run_dashboard.bat
+├─ run_stock_dynamic.bat
 ├─ run_stock_index_monitor.bat
 └─ src/
    └─ news_reader/
       ├─ __init__.py
       ├─ dashboard.py
       ├─ news.py
+      ├─ stock_dynamic.py
       └─ stock_monitor.py
 ```
 
@@ -64,6 +68,16 @@ python .\main.py stocks
 python .\main.py dashboard
 ```
 
+啟動股票動態視窗：
+
+```powershell
+python .\main.py dynamic
+```
+
+視窗右上角可在白天與深夜主題之間切換，不需要重啟程式。
+四大指數曲線圖以 2x2 區塊呈現，每個指數使用獨立座標範圍，並採用類似 Yahoo 股市的盤中線圖樣式：昨收基準線、漲紅跌綠、右側價格軸與線下淡色填滿。
+ETF 區塊會載入目前 TWSE OpenAPI 與 e添富可取得的台灣上市 ETF 清單，依資產規模由大到小排列，並提供滾動條瀏覽。雙擊任一 ETF 列，可開啟該 ETF 的詳細視窗，查看即時資訊與單檔曲線圖。
+
 ## 全部參數
 
 ### main.py
@@ -74,7 +88,7 @@ python .\main.py [command] [args]
 
 | 參數 | 預設 | 說明 |
 |---|---:|---|
-| `command` | `news` | 要執行的功能。可用 `news`、`stocks` 或 `dashboard`。 |
+| `command` | `news` | 要執行的功能。可用 `news`、`stocks`、`dashboard` 或 `dynamic`。 |
 | `args` | 無 | 傳給 `news` 或 `stocks` 的後續參數。 |
 
 ### news
@@ -163,6 +177,28 @@ python .\main.py dashboard --source auto --open
 python .\main.py dashboard -o .\dashboard.html
 ```
 
+### dynamic
+
+```powershell
+python .\main.py dynamic [options]
+```
+
+| 參數 | 預設 | 說明 |
+|---|---:|---|
+| `-i`, `--interval` | `10` | 視窗資料更新間隔秒數。 |
+| `--source` | `auto` | 資料來源，可用 `auto`、`twse`、`yahoo`。 |
+| `--timeout` | `15` | 網路請求逾時秒數。 |
+| `--retries` | `2` | 連線失敗時自動重試幾次。 |
+| `--history` | `80` | 曲線圖保留幾個歷史資料點。 |
+| `--no-etf` | 關閉 | 不顯示 ETF 清單。 |
+| `--verify-ssl` | 關閉 | 強制驗證 TWSE SSL 憑證。 |
+
+範例：
+
+```powershell
+python .\main.py dynamic -i 15 --source auto --history 120
+```
+
 ## 股票監控常用參數
 
 ```powershell
@@ -208,6 +244,7 @@ python .\stock_index_monitor.py
 
 - `run_news_reader.bat`
 - `run_dashboard.bat`
+- `run_stock_dynamic.bat`
 - `run_stock_index_monitor.bat`
 
 ## 資料來源
