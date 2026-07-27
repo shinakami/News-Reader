@@ -1,0 +1,149 @@
+News-Reader：使用終端介面開啟 Python 虛擬環境
+================================================
+
+專案位置：
+C:\Users\shina_chung\Documents\News-Reader
+
+
+一、開啟終端機並進入專案
+--------------------------
+
+PowerShell 或 Windows Terminal：
+
+cd C:\Users\shina_chung\Documents\News-Reader
+
+
+二、第一次使用：建立虛擬環境
+----------------------------
+
+如果專案內還沒有 .venv 資料夾，執行：
+
+py -m venv .venv
+
+若電腦無法使用 py，也可以改用：
+
+python -m venv .venv
+
+虛擬環境只需建立一次，以後不必重複建立。
+
+
+三、啟用虛擬環境
+----------------
+
+PowerShell：
+
+.\.venv\Scripts\Activate.ps1
+
+命令提示字元（cmd）：
+
+.venv\Scripts\activate.bat
+
+Git Bash：
+
+source .venv/Scripts/activate
+
+成功啟用後，命令列開頭通常會顯示：
+
+(.venv)
+
+
+四、PowerShell 拒絕執行啟用指令時
+----------------------------------
+
+若執行 .\.venv\Scripts\Activate.ps1 後看到以下錯誤：
+
+「因為這個系統上已停用指令碼執行，所以無法載入 Activate.ps1」
+
+或錯誤資訊中包含：
+
+PSSecurityException
+UnauthorizedAccess
+
+這代表 PowerShell 的執行原則禁止執行 .ps1 指令碼，不代表虛擬環境
+損壞。可只針對目前這個 PowerShell 視窗暫時放行：
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+然後再次執行：
+
+.\.venv\Scripts\Activate.ps1
+
+關閉該 PowerShell 視窗後，這項暫時設定就會失效，不會永久變更系統設定。
+
+如果不希望調整 PowerShell 執行原則，可直接使用虛擬環境中的 Python：
+
+.\.venv\Scripts\python.exe main.py dynamic
+
+也可以改用命令提示字元（cmd）進入專案，再啟用虛擬環境：
+
+cd /d C:\Users\shina_chung\Documents\News-Reader
+.venv\Scripts\activate.bat
+
+啟用成功後，命令列開頭通常會出現 (.venv)。
+
+
+五、安裝專案所需套件
+--------------------
+
+啟用虛擬環境後執行：
+
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+
+通常只有第一次建立虛擬環境，或 requirements.txt 有更新時需要執行。
+
+
+六、執行 News-Reader
+-------------------
+
+啟動動態股票 Dashboard：
+
+python main.py dynamic
+
+產生 HTML Dashboard 並開啟：
+
+python main.py dashboard --open
+
+執行新聞閱讀功能：
+
+python main.py news
+
+也可以在已啟用虛擬環境的終端機中執行專案提供的 BAT 檔：
+
+.\run_stock_dynamic.bat
+
+
+七、確認目前使用的是虛擬環境
+----------------------------
+
+執行：
+
+python -c "import sys; print(sys.executable)"
+
+正確啟用時，顯示的路徑應類似：
+
+C:\Users\shina_chung\Documents\News-Reader\.venv\Scripts\python.exe
+
+
+八、離開虛擬環境
+----------------
+
+執行：
+
+deactivate
+
+命令列開頭的 (.venv) 消失，就代表已離開虛擬環境。
+
+
+九、日後再次開啟的簡化流程
+--------------------------
+
+PowerShell：
+
+cd C:\Users\shina_chung\Documents\News-Reader
+.\.venv\Scripts\Activate.ps1
+python main.py dynamic
+
+程式使用完畢後：
+
+deactivate
