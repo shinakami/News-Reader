@@ -25,6 +25,7 @@ from news_reader.stock_monitor import (
     fetch_market_data,
     fetch_twse_json,
     first_level,
+    make_context,
     to_float,
     to_int,
 )
@@ -147,9 +148,13 @@ class EtfMarketRow:
         return self.change / self.previous_close * 100
 
 
-def fetch_etf_list(timeout: int) -> list[dict[str, str]]:
+def fetch_etf_list(timeout: int, verify_ssl: bool) -> list[dict[str, str]]:
     request = urllib.request.Request(ETF_LIST_URL, headers={"User-Agent": "Mozilla/5.0"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(
+        request,
+        timeout=timeout,
+        context=make_context(verify_ssl),
+    ) as response:
         rows = json.loads(response.read().decode("utf-8-sig"))
     return [
         row
@@ -167,7 +172,7 @@ def parse_float_text(value: str | None) -> float | None:
         return None
 
 
-def fetch_etf_profile_map(timeout: int) -> dict[str, dict[str, str]]:
+def fetch_etf_profile_map(timeout: int, verify_ssl: bool) -> dict[str, dict[str, str]]:
     body = urllib.parse.urlencode({}).encode()
     request = urllib.request.Request(
         ETF_PRODUCTS_URL,
@@ -179,7 +184,11 @@ def fetch_etf_profile_map(timeout: int) -> dict[str, dict[str, str]]:
             "X-Requested-With": "XMLHttpRequest",
         },
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
+    with urllib.request.urlopen(
+        request,
+        timeout=timeout,
+        context=make_context(verify_ssl),
+    ) as response:
         payload = json.loads(response.read().decode("utf-8-sig"))
     if payload.get("status") != "success":
         return {}
@@ -260,9 +269,9 @@ def chunked(values: list[str], size: int) -> list[list[str]]:
 
 
 def fetch_all_etf_quotes(timeout: int, retries: int, verify_ssl: bool) -> list[EtfMarketRow]:
-    openapi_rows = fetch_etf_list(timeout)
+    openapi_rows = fetch_etf_list(timeout, verify_ssl)
     try:
-        profiles = fetch_etf_profile_map(timeout)
+        profiles = fetch_etf_profile_map(timeout, verify_ssl)
     except Exception:
         profiles = {}
     fallback = {row["Code"]: row_from_openapi(row) for row in openapi_rows}
@@ -299,10 +308,10 @@ def fetch_one_etf_quote(code: str, timeout: int, retries: int, verify_ssl: bool)
     fallback = None
     profile = None
     try:
-        profile = fetch_etf_profile_map(timeout).get(code)
+        profile = fetch_etf_profile_map(timeout, verify_ssl).get(code)
     except Exception:
         profile = None
-    for row in fetch_etf_list(timeout):
+    for row in fetch_etf_list(timeout, verify_ssl):
         if row.get("Code") == code:
             fallback = enrich_etf_row(row_from_openapi(row), profile)
             break
