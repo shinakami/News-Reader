@@ -40,6 +40,9 @@ CHART_COLORS = {
 
 ETF_LIST_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 ETF_PRODUCTS_URL = "https://www.twse.com.tw/zh/ETFortune/ajaxProductsResult"
+INSTITUTION_TRADES_URL = "https://www.twse.com.tw/fund/BFI82U?response=json"
+TWSE_BREADTH_URL = "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX?response=json&type=MS"
+TPEX_BREADTH_URL = "https://www.tpex.org.tw/openapi/v1/tpex_mainborad_highlight"
 ETF_CODE_PATTERN = re.compile(r"^00[0-9A-Z]+$")
 ETF_BATCH_SIZE = 45
 
@@ -146,6 +149,127 @@ class EtfMarketRow:
         if self.change is None or not self.previous_close:
             return None
         return self.change / self.previous_close * 100
+
+
+@dataclass(frozen=True)
+class InstitutionTrade:
+    name: str
+    buy_amount: int
+    sell_amount: int
+    net_amount: int
+
+
+@dataclass(frozen=True)
+class InstitutionSnapshot:
+    market_date: str
+    rows: list[InstitutionTrade]
+
+
+@dataclass(frozen=True)
+class MarketBreadth:
+    twse_date: str
+    tpex_date: str
+    twse_up: int
+    twse_flat: int
+    twse_down: int
+    tpex_up: int
+    tpex_flat: int
+    tpex_down: int
+
+    @property
+    def totals(self) -> tuple[int, int, int]:
+        return (
+            self.twse_up + self.tpex_up,
+            self.twse_flat + self.tpex_flat,
+            self.twse_down + self.tpex_down,
+        )
+
+
+def parse_amount(value: str | int | None) -> int:
+    if value is None:
+        return 0
+    return int(str(value).replace(",", ""))
+
+
+def fetch_json(url: str, timeout: int, verify_ssl: bool) -> object:
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(
+        request,
+        timeout=timeout,
+        context=make_context(verify_ssl),
+    ) as response:
+        return json.loads(response.read().decode("utf-8-sig"))
+
+
+def fetch_institution_trades(timeout: int, verify_ssl: bool) -> InstitutionSnapshot:
+    payload = fetch_json(INSTITUTION_TRADES_URL, timeout, verify_ssl)
+    if not isinstance(payload, dict):
+        raise RuntimeError("TWSE 三大法人資料格式錯誤")
+
+    if payload.get("stat") != "OK":
+        raise RuntimeError(payload.get("stat") or "TWSE 三大法人資料格式錯誤")
+
+    raw_rows = {
+        row[0]: tuple(parse_amount(value) for value in row[1:4])
+        for row in payload.get("data", [])
+        if len(row) >= 4
+    }
+    foreign = raw_rows.get("外資及陸資(不含外資自營商)", (0, 0, 0))
+    trust = raw_rows.get("投信", (0, 0, 0))
+    dealer_parts = [
+        raw_rows.get("自營商(自行買賣)", (0, 0, 0)),
+        raw_rows.get("自營商(避險)", (0, 0, 0)),
+    ]
+    dealer = tuple(sum(part[index] for part in dealer_parts) for index in range(3))
+    rows = [
+        InstitutionTrade("外資及陸資", *foreign),
+        InstitutionTrade("投信", *trust),
+        InstitutionTrade("自營商", *dealer),
+    ]
+    return InstitutionSnapshot(payload.get("date", ""), rows)
+
+
+def parse_breadth_count(value: str | int | None) -> int:
+    text = str(value or "0").split("(", 1)[0]
+    return parse_amount(text)
+
+
+def roc_date_to_iso(value: str) -> str:
+    if len(value) != 7 or not value.isdigit():
+        return value
+    return f"{int(value[:3]) + 1911:04d}{value[3:]}"
+
+
+def fetch_market_breadth(timeout: int, verify_ssl: bool) -> MarketBreadth:
+    twse_payload = fetch_json(TWSE_BREADTH_URL, timeout, verify_ssl)
+    tpex_payload = fetch_json(TPEX_BREADTH_URL, timeout, verify_ssl)
+    if not isinstance(twse_payload, dict) or twse_payload.get("stat") != "OK":
+        raise RuntimeError("TWSE 上市漲跌家數載入失敗")
+    if not isinstance(tpex_payload, list) or not tpex_payload:
+        raise RuntimeError("TPEx 上櫃漲跌家數載入失敗")
+
+    breadth_table = next(
+        (
+            table
+            for table in twse_payload.get("tables", [])
+            if table.get("title") == "漲跌證券數合計"
+        ),
+        None,
+    )
+    if not breadth_table:
+        raise RuntimeError("TWSE 上市漲跌家數格式錯誤")
+    twse_rows = {row[0]: row for row in breadth_table.get("data", []) if len(row) >= 3}
+    tpex = tpex_payload[0]
+    return MarketBreadth(
+        twse_date=twse_payload.get("date", ""),
+        tpex_date=roc_date_to_iso(tpex.get("Date", "")),
+        twse_up=parse_breadth_count(twse_rows.get("上漲(漲停)", ["", "", 0])[2]),
+        twse_flat=parse_breadth_count(twse_rows.get("持平", ["", "", 0])[2]),
+        twse_down=parse_breadth_count(twse_rows.get("下跌(跌停)", ["", "", 0])[2]),
+        tpex_up=parse_amount(tpex.get("PriceRiseCompanyNumbers")),
+        tpex_flat=parse_amount(tpex.get("PriceFlatCompanyNumbers")),
+        tpex_down=parse_amount(tpex.get("PriceDeclineCompanyNumbers")),
+    )
 
 
 def fetch_etf_list(timeout: int, verify_ssl: bool) -> list[dict[str, str]]:
@@ -351,6 +475,7 @@ class StockDynamicApp:
         self.history: dict[str, list[float]] = defaultdict(list)
         self.index_previous_close: dict[str, float | None] = {}
         self.etf_rows: dict[str, EtfMarketRow] = {}
+        self.market_window: MarketOverviewWindow | None = None
         self.result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.loading = False
         self.closed = False
@@ -413,6 +538,12 @@ class StockDynamicApp:
         ).grid(row=2, column=1, sticky="e", pady=(8, 0))
         actions = ttk.Frame(header_inner, style="Header.TFrame")
         actions.grid(row=0, column=1, sticky="e")
+        ttk.Button(
+            actions,
+            text="市場籌碼",
+            style="Flat.TButton",
+            command=self.open_market_overview,
+        ).pack(side="left", padx=(0, 8))
         ttk.Button(actions, textvariable=self.theme_button_text, style="Flat.TButton", command=self.toggle_theme).pack(side="left", padx=(0, 8))
         refresh_button = ttk.Button(actions, text="立即更新", style="Flat.TButton", command=self.refresh)
         refresh_button.pack(side="left")
@@ -683,9 +814,25 @@ class StockDynamicApp:
         self.applying_theme = True
         try:
             self.apply_theme()
+            if self.market_window and not self.market_window.closed:
+                self.market_window.apply_theme()
         finally:
             self.applying_theme = False
         self.root.after_idle(lambda: self.layout_for_width(self.root.winfo_width(), force=True))
+
+    def open_market_overview(self) -> None:
+        if self.market_window and not self.market_window.closed:
+            self.market_window.window.deiconify()
+            self.market_window.window.lift()
+            self.market_window.window.focus_force()
+            return
+        self.market_window = MarketOverviewWindow(
+            parent=self.root,
+            timeout=self.timeout,
+            verify_ssl=self.verify_ssl,
+            refresh_interval=max(60, self.interval),
+            theme_getter=lambda: self.theme,
+        )
 
     def close(self) -> None:
         self.closed = True
@@ -945,6 +1092,282 @@ class StockDynamicApp:
             fill=color,
             outline=color,
         )
+
+
+class MarketOverviewWindow:
+    def __init__(
+        self,
+        parent: tk.Tk,
+        timeout: int,
+        verify_ssl: bool,
+        refresh_interval: int,
+        theme_getter,
+    ) -> None:
+        self.timeout = timeout
+        self.verify_ssl = verify_ssl
+        self.refresh_interval = refresh_interval
+        self.theme_getter = theme_getter
+        self.queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.loading = False
+        self.closed = False
+        self.breadth: MarketBreadth | None = None
+
+        self.window = tk.Toplevel(parent)
+        self.window.title("市場籌碼｜三大法人與漲跌家數")
+        self.window.geometry("900x680")
+        self.window.minsize(700, 560)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.status_text = tk.StringVar(value="正在載入最新資料...")
+        self.institution_date_text = tk.StringVar(value="三大法人：載入中")
+        self.breadth_date_text = tk.StringVar(value="市場漲跌：載入中")
+        self.build_ui()
+        self.apply_theme()
+        self.refresh()
+        self.window.after(200, self.process_results)
+
+    def build_ui(self) -> None:
+        self.frame = ttk.Frame(self.window, style="TFrame", padding=16)
+        self.frame.pack(fill="both", expand=True)
+
+        header = ttk.Frame(self.frame, style="Header.TFrame", padding=(18, 14))
+        header.pack(fill="x", pady=(0, 10))
+        ttk.Label(
+            header,
+            text="市場籌碼",
+            style="Header.TLabel",
+            font=("Microsoft JhengHei UI", 20, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            textvariable=self.status_text,
+            style="Muted.TLabel",
+            font=("Microsoft JhengHei UI", 9),
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(
+            header,
+            text="立即更新",
+            style="Flat.TButton",
+            command=self.refresh,
+        ).grid(row=0, column=1, rowspan=2, sticky="e")
+        header.columnconfigure(0, weight=1)
+
+        institution_panel = ttk.Frame(self.frame, style="Card.TFrame", padding=16)
+        institution_panel.pack(fill="x", pady=(0, 10))
+        institution_header = ttk.Frame(institution_panel, style="Card.TFrame")
+        institution_header.pack(fill="x")
+        ttk.Label(
+            institution_header,
+            text="三大法人買賣金額",
+            style="CardTitle.TLabel",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+        ).pack(side="left")
+        ttk.Label(
+            institution_header,
+            textvariable=self.institution_date_text,
+            style="Muted.TLabel",
+            font=("Microsoft JhengHei UI", 9),
+        ).pack(side="right")
+
+        columns = ("institution", "buy", "sell", "net")
+        self.institution_tree = ttk.Treeview(
+            institution_panel,
+            columns=columns,
+            show="headings",
+            height=3,
+        )
+        headings = {
+            "institution": "法人",
+            "buy": "買進金額（億）",
+            "sell": "賣出金額（億）",
+            "net": "買賣超（億）",
+        }
+        widths = {"institution": 150, "buy": 170, "sell": 170, "net": 170}
+        for column in columns:
+            self.institution_tree.heading(column, text=headings[column])
+            self.institution_tree.column(column, width=widths[column], anchor="e")
+        self.institution_tree.column("institution", anchor="w")
+        self.institution_tree.pack(fill="x", pady=(8, 0))
+
+        breadth_panel = ttk.Frame(self.frame, style="Card.TFrame", padding=16)
+        breadth_panel.pack(fill="both", expand=True)
+        breadth_header = ttk.Frame(breadth_panel, style="Card.TFrame")
+        breadth_header.pack(fill="x")
+        ttk.Label(
+            breadth_header,
+            text="全台上市＋上櫃漲跌家數",
+            style="CardTitle.TLabel",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+        ).pack(side="left")
+        ttk.Label(
+            breadth_header,
+            textvariable=self.breadth_date_text,
+            style="Muted.TLabel",
+            font=("Microsoft JhengHei UI", 9),
+        ).pack(side="right")
+        self.breadth_canvas = tk.Canvas(
+            breadth_panel,
+            height=280,
+            highlightthickness=0,
+        )
+        self.breadth_canvas.pack(fill="both", expand=True, pady=(8, 0))
+        self.breadth_canvas.bind("<Configure>", lambda _event: self.draw_breadth_chart())
+
+    def apply_theme(self) -> None:
+        theme = self.theme_getter()
+        self.window.configure(bg=theme["bg"])
+        self.institution_tree.tag_configure("up", foreground=theme["up"])
+        self.institution_tree.tag_configure("down", foreground=theme["down"])
+        self.breadth_canvas.configure(bg=theme["surface"])
+        self.draw_breadth_chart()
+
+    def close(self) -> None:
+        self.closed = True
+        self.window.destroy()
+
+    def refresh(self) -> None:
+        if self.closed or self.loading:
+            return
+        self.loading = True
+        self.status_text.set("正在更新三大法人與市場漲跌家數...")
+        threading.Thread(target=self.fetch_worker, daemon=True).start()
+
+    def fetch_worker(self) -> None:
+        try:
+            institutions = fetch_institution_trades(self.timeout, self.verify_ssl)
+            breadth = fetch_market_breadth(self.timeout, self.verify_ssl)
+            self.queue.put(("data", (institutions, breadth)))
+        except Exception as exc:
+            self.queue.put(("error", exc))
+
+    def process_results(self) -> None:
+        try:
+            while True:
+                kind, payload = self.queue.get_nowait()
+                self.loading = False
+                if kind == "data":
+                    institutions, breadth = payload
+                    self.update_data(institutions, breadth)
+                else:
+                    self.status_text.set(f"更新失敗：{payload}")
+        except queue.Empty:
+            pass
+        if not self.closed:
+            self.window.after(200, self.process_results)
+
+    @staticmethod
+    def format_date(value: str) -> str:
+        return f"{value[:4]}-{value[4:6]}-{value[6:8]}" if len(value) == 8 else value or "--"
+
+    def update_data(
+        self,
+        institutions: InstitutionSnapshot,
+        breadth: MarketBreadth,
+    ) -> None:
+        self.status_text.set(
+            f"本機更新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}｜每 {self.refresh_interval} 秒更新"
+        )
+        self.institution_date_text.set(
+            f"最新公布：{self.format_date(institutions.market_date)}｜單位：億元"
+        )
+        for item in self.institution_tree.get_children():
+            self.institution_tree.delete(item)
+        for row in institutions.rows:
+            tag = "up" if row.net_amount >= 0 else "down"
+            self.institution_tree.insert(
+                "",
+                "end",
+                values=(
+                    row.name,
+                    fmt_number(row.buy_amount / 100_000_000),
+                    fmt_number(row.sell_amount / 100_000_000),
+                    fmt_signed(row.net_amount / 100_000_000),
+                ),
+                tags=(tag,),
+            )
+
+        self.breadth = breadth
+        twse_date = self.format_date(breadth.twse_date)
+        tpex_date = self.format_date(breadth.tpex_date)
+        if twse_date == tpex_date:
+            self.breadth_date_text.set(f"資料日：{twse_date}")
+        else:
+            self.breadth_date_text.set(f"上市：{twse_date}｜上櫃：{tpex_date}")
+        self.apply_theme()
+        self.window.after(self.refresh_interval * 1000, self.refresh)
+
+    def draw_breadth_chart(self) -> None:
+        canvas = self.breadth_canvas
+        canvas.delete("all")
+        theme = self.theme_getter()
+        width = max(canvas.winfo_width(), 620)
+        height = max(canvas.winfo_height(), 260)
+        left, right, top, bottom = 58, 28, 26, 72
+        plot_width = width - left - right
+        plot_height = height - top - bottom
+        canvas.create_rectangle(
+            left,
+            top,
+            width - right,
+            height - bottom,
+            fill=theme["surface_alt"],
+            outline=theme["line"],
+        )
+        if self.breadth is None:
+            canvas.create_text(
+                width / 2,
+                height / 2,
+                text="正在載入市場漲跌家數...",
+                fill=theme["muted"],
+                font=("Microsoft JhengHei UI", 11),
+            )
+            return
+
+        breadth = self.breadth
+        totals = breadth.totals
+        labels = ("上漲", "持平", "下跌")
+        colors = (theme["up"], theme["muted"], theme["down"])
+        splits = (
+            (breadth.twse_up, breadth.tpex_up),
+            (breadth.twse_flat, breadth.tpex_flat),
+            (breadth.twse_down, breadth.tpex_down),
+        )
+        maximum = max(totals) or 1
+        group_width = plot_width / 3
+        bar_width = min(120, group_width * 0.48)
+        for index, (label, total, color, split) in enumerate(zip(labels, totals, colors, splits)):
+            center_x = left + group_width * (index + 0.5)
+            bar_height = plot_height * total / maximum
+            y0 = top + plot_height - bar_height
+            canvas.create_rectangle(
+                center_x - bar_width / 2,
+                y0,
+                center_x + bar_width / 2,
+                top + plot_height,
+                fill=color,
+                outline="",
+            )
+            canvas.create_text(
+                center_x,
+                max(top + 12, y0 - 12),
+                text=f"{total:,}",
+                fill=color,
+                font=("Segoe UI", 13, "bold"),
+            )
+            canvas.create_text(
+                center_x,
+                height - bottom + 20,
+                text=label,
+                fill=theme["text"],
+                font=("Microsoft JhengHei UI", 11, "bold"),
+            )
+            canvas.create_text(
+                center_x,
+                height - bottom + 43,
+                text=f"上市 {split[0]:,}｜上櫃 {split[1]:,}",
+                fill=theme["muted"],
+                font=("Microsoft JhengHei UI", 9),
+            )
 
 
 class EtfDetailWindow:
