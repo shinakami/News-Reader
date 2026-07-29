@@ -12,7 +12,10 @@ env/
 build/
 dist/
 *.egg-info/
+
+# Generated dashboard HTML
 news_dashboard.html
+stock_market_dashboard.html
 
 # Test and coverage output
 .pytest_cache/
