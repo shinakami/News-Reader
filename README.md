@@ -106,12 +106,23 @@ python .\main.py news [queries...] [options]
 | `--region` | `TW` | Google News 地區參數。 |
 | `--timeout` | `15` | 網路請求逾時秒數。 |
 | `--links` | 關閉 | 同時列出新聞連結。 |
+| `--dashboard` | 關閉 | 將本次抓到的新聞產生為 HTML Dashboard。 |
+| `--open` | 關閉 | 產生 Dashboard 後用預設瀏覽器開啟；使用此參數時不必另外指定 `--dashboard`。 |
+| `-o`, `--output` | `news_dashboard.html` | 新聞 Dashboard 的輸出路徑。 |
 
 範例：
 
 ```powershell
 python .\main.py news AI 財經 -n 10 --links
 ```
+
+產生新聞 Dashboard，並用預設瀏覽器開啟：
+
+```powershell
+python .\main.py news --dashboard --open
+```
+
+Dashboard 支援分類篩選與文字搜尋；點擊新聞圖片、標題或「閱讀新聞」會在新分頁開啟原始新聞連結。
 
 ### stocks
 
@@ -244,6 +255,7 @@ python .\stock_index_monitor.py
 也可直接雙擊：
 
 - `run_news_reader.bat`
+- `run_news_dashboard.bat`
 - `run_dashboard.bat`
 - `run_stock_dynamic.bat`
 - `run_stock_index_monitor.bat`
