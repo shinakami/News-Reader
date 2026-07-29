@@ -13,7 +13,7 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from news_reader.dashboard import main as dashboard_main  # noqa: E402
+from news_reader.stock_market_dashboard import main as dashboard_main  # noqa: E402
 from news_reader.news import main as news_main  # noqa: E402
 from news_reader.stock_dynamic import main as dynamic_main  # noqa: E402
 from news_reader.stock_monitor import main as stock_main  # noqa: E402

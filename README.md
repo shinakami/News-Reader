@@ -28,7 +28,7 @@ News Reader/
 └─ src/
    └─ news_reader/
       ├─ __init__.py
-      ├─ dashboard.py
+      ├─ stock_market_dashboard.py
       ├─ news.py
       ├─ stock_dynamic.py
       └─ stock_monitor.py
@@ -169,7 +169,7 @@ python .\main.py dashboard [options]
 
 | 參數 | 預設 | 說明 |
 |---|---:|---|
-| `-o`, `--output` | `dashboard.html` | 輸出的 HTML Dashboard 檔案路徑。 |
+| `-o`, `--output` | `stock_market_dashboard.html` | 輸出的 HTML Dashboard 檔案路徑。 |
 | `--source` | `auto` | 資料來源，可用 `auto`、`twse`、`yahoo`。 |
 | `--timeout` | `15` | 網路請求逾時秒數。 |
 | `--retries` | `2` | 連線失敗時自動重試幾次。 |
@@ -186,7 +186,7 @@ python .\main.py dashboard --source auto --open
 指定輸出檔案：
 
 ```powershell
-python .\main.py dashboard -o .\dashboard.html
+python .\main.py dashboard -o .\stock_market_dashboard.html
 ```
 
 ### dynamic

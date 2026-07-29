@@ -16,7 +16,7 @@ from typing import Any, Sequence
 from news_reader.stock_monitor import fetch_market_data
 
 
-DEFAULT_OUTPUT = "dashboard.html"
+DEFAULT_OUTPUT = "stock_market_dashboard.html"
 
 
 def fmt_number(value: float | int | None, digits: int = 2) -> str:
@@ -144,15 +144,16 @@ def render_dashboard(
   <title>台股監控 Dashboard</title>
   <style>
     :root {{
-      color-scheme: light;
-      --bg: #f4f6f8;
-      --surface: #ffffff;
-      --text: #1d252d;
-      --muted: #66717d;
-      --line: #d9e0e7;
-      --up: #b42318;
-      --down: #067647;
-      --accent: #2563eb;
+      color-scheme: dark;
+      --bg: #090d14;
+      --surface: #121923;
+      --surface-alt: #1a2431;
+      --text: #edf2f7;
+      --muted: #98a7b8;
+      --line: #2a3747;
+      --up: #ff6b6b;
+      --down: #42d392;
+      --accent: #60a5fa;
       font-family: "Microsoft JhengHei", "Segoe UI", sans-serif;
     }}
     * {{ box-sizing: border-box; }}
@@ -190,7 +191,7 @@ def render_dashboard(
       background: var(--surface);
       border: 1px solid var(--line);
       border-radius: 8px;
-      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
     }}
     .metric-card {{ padding: 16px; }}
     .metric-top {{
@@ -235,7 +236,7 @@ def render_dashboard(
     }}
     .range-line div {{
       height: 7px;
-      background: #e8edf3;
+      background: var(--surface-alt);
       border-radius: 999px;
       overflow: hidden;
     }}
@@ -269,7 +270,7 @@ def render_dashboard(
     }}
     .bar-track {{
       height: 14px;
-      background: #e8edf3;
+      background: var(--surface-alt);
       border-radius: 999px;
       overflow: hidden;
     }}
@@ -296,7 +297,8 @@ def render_dashboard(
     td:nth-child(1), td:nth-child(2) {{
       text-align: left;
     }}
-    th {{ color: var(--muted); font-weight: 600; }}
+    th {{ color: var(--muted); font-weight: 600; background: var(--surface-alt); }}
+    tbody tr:hover {{ background: rgba(96, 165, 250, 0.08); }}
     .meta {{
       color: var(--muted);
       font-size: 13px;

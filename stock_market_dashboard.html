@@ -6,15 +6,16 @@
   <title>台股監控 Dashboard</title>
   <style>
     :root {
-      color-scheme: light;
-      --bg: #f4f6f8;
-      --surface: #ffffff;
-      --text: #1d252d;
-      --muted: #66717d;
-      --line: #d9e0e7;
-      --up: #b42318;
-      --down: #067647;
-      --accent: #2563eb;
+      color-scheme: dark;
+      --bg: #090d14;
+      --surface: #121923;
+      --surface-alt: #1a2431;
+      --text: #edf2f7;
+      --muted: #98a7b8;
+      --line: #2a3747;
+      --up: #ff6b6b;
+      --down: #42d392;
+      --accent: #60a5fa;
       font-family: "Microsoft JhengHei", "Segoe UI", sans-serif;
     }
     * { box-sizing: border-box; }
@@ -52,7 +53,7 @@
       background: var(--surface);
       border: 1px solid var(--line);
       border-radius: 8px;
-      box-shadow: 0 1px 2px rgba(16, 24, 40, 0.05);
+      box-shadow: 0 10px 28px rgba(0, 0, 0, 0.28);
     }
     .metric-card { padding: 16px; }
     .metric-top {
@@ -97,7 +98,7 @@
     }
     .range-line div {
       height: 7px;
-      background: #e8edf3;
+      background: var(--surface-alt);
       border-radius: 999px;
       overflow: hidden;
     }
@@ -131,7 +132,7 @@
     }
     .bar-track {
       height: 14px;
-      background: #e8edf3;
+      background: var(--surface-alt);
       border-radius: 999px;
       overflow: hidden;
     }
@@ -158,7 +159,8 @@
     td:nth-child(1), td:nth-child(2) {
       text-align: left;
     }
-    th { color: var(--muted); font-weight: 600; }
+    th { color: var(--muted); font-weight: 600; background: var(--surface-alt); }
+    tbody tr:hover { background: rgba(96, 165, 250, 0.08); }
     .meta {
       color: var(--muted);
       font-size: 13px;
@@ -178,7 +180,7 @@
 <body>
   <header>
     <h1>台股監控 Dashboard</h1>
-    <p>根據目前抓到的四大指數與 ETF 即時快照產生。資料來源：TWSE；行情時間：20260618 14:28:21；產生時間：2026-06-18 14:28:21</p>
+    <p>根據目前抓到的四大指數與 ETF 即時快照產生。資料來源：TWSE；行情時間：20260729 13:58:26；產生時間：2026-07-29 13:58:26</p>
   </header>
   <main>
     <section class="summary">
@@ -188,14 +190,14 @@
                 <h2>加權指數</h2>
                 <span>13:33:00</span>
               </div>
-              <div class="metric-value">46,465.20</div>
-              <div class="metric-change up">
-                +587.81 / +1.28%
+              <div class="metric-value">40,039.18</div>
+              <div class="metric-change down">
+                -1,564.18 / -3.76%
               </div>
               <div class="range-line">
-                <span>45,972.26</span>
-                <div><b class="up" style="width:40.5%"></b></div>
-                <span>46,565.70</span>
+                <span>39,384.85</span>
+                <div><b class="down" style="width:72.9%"></b></div>
+                <span>41,698.39</span>
               </div>
             </section>
             
@@ -204,14 +206,14 @@
                 <h2>櫃買指數</h2>
                 <span>13:33:00</span>
               </div>
-              <div class="metric-value">447.06</div>
-              <div class="metric-change up">
-                +13.72 / +3.17%
+              <div class="metric-value">334.24</div>
+              <div class="metric-change down">
+                -18.18 / -5.16%
               </div>
               <div class="range-line">
-                <span>434.54</span>
-                <div><b class="up" style="width:100.0%"></b></div>
-                <span>447.06</span>
+                <span>327.79</span>
+                <div><b class="down" style="width:100.0%"></b></div>
+                <span>354.18</span>
               </div>
             </section>
             
@@ -220,14 +222,14 @@
                 <h2>電子類指數</h2>
                 <span>13:33:00</span>
               </div>
-              <div class="metric-value">2,991.61</div>
-              <div class="metric-change up">
-                +35.85 / +1.21%
+              <div class="metric-value">2,513.96</div>
+              <div class="metric-change down">
+                -113.78 / -4.33%
               </div>
               <div class="range-line">
-                <span>2,960.71</span>
-                <div><b class="up" style="width:38.3%"></b></div>
-                <span>2,997.93</span>
+                <span>2,474.21</span>
+                <div><b class="down" style="width:83.9%"></b></div>
+                <span>2,630.89</span>
               </div>
             </section>
             
@@ -236,14 +238,14 @@
                 <h2>金融保險類指數</h2>
                 <span>13:33:00</span>
               </div>
-              <div class="metric-value">3,237.51</div>
-              <div class="metric-change up">
-                +43.57 / +1.36%
+              <div class="metric-value">3,067.13</div>
+              <div class="metric-change down">
+                -29.71 / -0.96%
               </div>
               <div class="range-line">
-                <span>3,194.01</span>
-                <div><b class="up" style="width:43.1%"></b></div>
-                <span>3,274.81</span>
+                <span>3,014.29</span>
+                <div><b class="down" style="width:18.6%"></b></div>
+                <span>3,129.36</span>
               </div>
             </section>
             
@@ -280,60 +282,60 @@
             <tr>
               <td>0050</td>
               <td>元大台灣50</td>
-              <td>107.30</td>
-              <td class="up">+1.30</td>
-              <td class="up">+1.23%</td>
-              <td>107.45</td>
-              <td>106.65</td>
-              <td>74,122</td>
+              <td>93.70</td>
+              <td class="down">-3.45</td>
+              <td class="down">-3.55%</td>
+              <td>97.00</td>
+              <td>91.80</td>
+              <td>480,683</td>
               <td>13:30:00</td>
             </tr>
             
             <tr>
               <td>0056</td>
               <td>元大高股息</td>
-              <td>52.80</td>
-              <td class="up">+0.85</td>
-              <td class="up">+1.64%</td>
-              <td>52.85</td>
-              <td>52.40</td>
-              <td>32,644</td>
+              <td>46.73</td>
+              <td class="down">-1.46</td>
+              <td class="down">-3.03%</td>
+              <td>48.67</td>
+              <td>45.98</td>
+              <td>129,935</td>
               <td>13:30:00</td>
             </tr>
             
             <tr>
               <td>00878</td>
               <td>國泰永續高股息</td>
-              <td>33.67</td>
-              <td class="up">+0.40</td>
-              <td class="up">+1.20%</td>
-              <td>33.71</td>
-              <td>33.45</td>
-              <td>36,264</td>
+              <td>30.91</td>
+              <td class="down">-0.59</td>
+              <td class="down">-1.87%</td>
+              <td>32.02</td>
+              <td>30.41</td>
+              <td>90,015</td>
               <td>13:30:00</td>
             </tr>
             
             <tr>
               <td>00919</td>
               <td>群益台灣精選高息</td>
-              <td>30.81</td>
-              <td class="up">+0.46</td>
-              <td class="up">+1.52%</td>
-              <td>30.94</td>
-              <td>30.51</td>
-              <td>171,496</td>
+              <td>28.50</td>
+              <td class="down">-0.39</td>
+              <td class="down">-1.35%</td>
+              <td>29.39</td>
+              <td>28.02</td>
+              <td>128,376</td>
               <td>13:30:00</td>
             </tr>
             
             <tr>
               <td>006208</td>
               <td>富邦台50</td>
-              <td>249.10</td>
-              <td class="up">+2.80</td>
-              <td class="up">+1.14%</td>
-              <td>249.10</td>
-              <td>246.95</td>
-              <td>3,666</td>
+              <td>214.05</td>
+              <td class="down">-8.05</td>
+              <td class="down">-3.62%</td>
+              <td>222.25</td>
+              <td>210.20</td>
+              <td>8,173</td>
               <td>13:30:00</td>
             </tr>
             </tbody>
@@ -347,7 +349,7 @@
     </section>
   </main>
   <script>
-    const DASHBOARD_DATA = {"indices": [{"name": "加權指數", "price": 46465.2, "previous_close": 45877.39, "open_price": 45972.26, "high": 46565.7, "low": 45972.26, "market_time": "13:33:00", "change": 587.8099999999977, "change_percent": 1.2812629489166618}, {"name": "櫃買指數", "price": 447.06, "previous_close": 433.34, "open_price": 434.54, "high": 447.06, "low": 434.54, "market_time": "13:33:00", "change": 13.720000000000027, "change_percent": 3.166105136844055}, {"name": "電子類指數", "price": 2991.61, "previous_close": 2955.76, "open_price": 2960.71, "high": 2997.93, "low": 2960.71, "market_time": "13:33:00", "change": 35.84999999999991, "change_percent": 1.2128860259290302}, {"name": "金融保險類指數", "price": 3237.51, "previous_close": 3193.94, "open_price": 3194.01, "high": 3274.81, "low": 3194.01, "market_time": "13:33:00", "change": 43.570000000000164, "change_percent": 1.364145851205726}], "etfs": [{"code": "0050", "name": "元大台灣50", "price": 107.3, "previous_close": 106.0, "bid": 107.3, "ask": 107.35, "high": 107.45, "low": 106.65, "volume": 74122, "market_time": "13:30:00", "change": 1.2999999999999972, "change_percent": 1.22641509433962, "display_price": 107.3}, {"code": "0056", "name": "元大高股息", "price": 52.8, "previous_close": 51.95, "bid": 52.8, "ask": 52.85, "high": 52.85, "low": 52.4, "volume": 32644, "market_time": "13:30:00", "change": 0.8499999999999943, "change_percent": 1.6361886429258792, "display_price": 52.8}, {"code": "00878", "name": "國泰永續高股息", "price": 33.67, "previous_close": 33.27, "bid": 33.66, "ask": 33.67, "high": 33.71, "low": 33.45, "volume": 36264, "market_time": "13:30:00", "change": 0.3999999999999986, "change_percent": 1.202284340246464, "display_price": 33.67}, {"code": "00919", "name": "群益台灣精選高息", "price": 30.81, "previous_close": 30.35, "bid": 30.8, "ask": 30.81, "high": 30.94, "low": 30.51, "volume": 171496, "market_time": "13:30:00", "change": 0.4599999999999973, "change_percent": 1.515650741350897, "display_price": 30.81}, {"code": "006208", "name": "富邦台50", "price": 249.1, "previous_close": 246.3, "bid": 248.7, "ask": 249.1, "high": 249.1, "low": 246.95, "volume": 3666, "market_time": "13:30:00", "change": 2.799999999999983, "change_percent": 1.1368250101502162, "display_price": 249.1}], "apiTime": "20260618 14:28:21", "dataSource": "TWSE", "generatedAt": "2026-06-18 14:28:21"};
+    const DASHBOARD_DATA = {"indices": [{"name": "加權指數", "price": 40039.18, "previous_close": 41603.36, "open_price": 41491.48, "high": 41698.39, "low": 39384.85, "market_time": "13:33:00", "change": -1564.1800000000003, "change_percent": -3.759744405259576}, {"name": "櫃買指數", "price": 334.24, "previous_close": 352.42, "open_price": 352.31, "high": 354.18, "low": 327.79, "market_time": "13:33:00", "change": -18.180000000000007, "change_percent": -5.15861755859486}, {"name": "電子類指數", "price": 2513.96, "previous_close": 2627.74, "open_price": 2618.06, "high": 2630.89, "low": 2474.21, "market_time": "13:33:00", "change": -113.77999999999975, "change_percent": -4.32995654060142}, {"name": "金融保險類指數", "price": 3067.13, "previous_close": 3096.84, "open_price": 3102.18, "high": 3129.36, "low": 3014.29, "market_time": "13:33:00", "change": -29.710000000000036, "change_percent": -0.9593650301597769}], "etfs": [{"code": "0050", "name": "元大台灣50", "price": 93.7, "previous_close": 97.15, "bid": 93.65, "ask": 93.7, "high": 97.0, "low": 91.8, "volume": 480683, "market_time": "13:30:00", "change": -3.450000000000003, "change_percent": -3.5512094698919223, "display_price": 93.7}, {"code": "0056", "name": "元大高股息", "price": 46.73, "previous_close": 48.19, "bid": 46.73, "ask": 46.74, "high": 48.67, "low": 45.98, "volume": 129935, "market_time": "13:30:00", "change": -1.4600000000000009, "change_percent": -3.0296742062668622, "display_price": 46.73}, {"code": "00878", "name": "國泰永續高股息", "price": 30.91, "previous_close": 31.5, "bid": 30.9, "ask": 30.91, "high": 32.02, "low": 30.41, "volume": 90015, "market_time": "13:30:00", "change": -0.5899999999999999, "change_percent": -1.8730158730158726, "display_price": 30.91}, {"code": "00919", "name": "群益台灣精選高息", "price": 28.5, "previous_close": 28.89, "bid": 28.49, "ask": 28.5, "high": 29.39, "low": 28.02, "volume": 128376, "market_time": "13:30:00", "change": -0.39000000000000057, "change_percent": -1.3499480789200435, "display_price": 28.5}, {"code": "006208", "name": "富邦台50", "price": 214.05, "previous_close": 222.1, "bid": 214.0, "ask": 214.05, "high": 222.25, "low": 210.2, "volume": 8173, "market_time": "13:30:00", "change": -8.049999999999983, "change_percent": -3.6244934714092674, "display_price": 214.05}], "apiTime": "20260729 13:58:26", "dataSource": "TWSE", "generatedAt": "2026-07-29 13:58:26"};
     const maxAbs = Math.max(1, ...DASHBOARD_DATA.indices.map(item => Math.abs(item.change_percent || 0)));
     const bars = document.getElementById("changeBars");
     DASHBOARD_DATA.indices.forEach(item => {
