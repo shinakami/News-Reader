@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tkinter stock quote window with live price cards and line charts."""
+"""Tkinter stock quote window with live cards and OHLC candlestick charts."""
 
 from __future__ import annotations
 
@@ -9,10 +9,11 @@ import queue
 import re
 import sys
 import threading
+import time
 import tkinter as tk
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time as clock_time
 from tkinter import ttk
 from typing import Sequence
 import urllib.request
@@ -20,6 +21,7 @@ import urllib.parse
 
 from news_reader.stock_monitor import (
     INDICES,
+    YAHOO_INDICES,
     EtfQuote,
     IndexQuote,
     fetch_market_data,
@@ -37,6 +39,9 @@ CHART_COLORS = {
     "電子類指數": "#0891b2",
     "金融保險類指數": "#ca8a04",
 }
+
+YAHOO_SYMBOL_BY_NAME = {name: symbol for symbol, name in YAHOO_INDICES.items()}
+MA_PERIODS = (5, 10, 20)
 
 ETF_LIST_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 ETF_PRODUCTS_URL = "https://www.twse.com.tw/zh/ETFortune/ajaxProductsResult"
@@ -62,6 +67,9 @@ THEMES = {
         "up_fill": "#fee2e2",
         "down_fill": "#dcfce7",
         "accent": "#2563eb",
+        "ma5": "#38bdf8",
+        "ma10": "#7c3aed",
+        "ma20": "#ea580c",
         "selected": "#dbeafe",
     },
     "night": {
@@ -79,9 +87,360 @@ THEMES = {
         "up_fill": "#3f1f26",
         "down_fill": "#14362b",
         "accent": "#60a5fa",
+        "ma5": "#38bdf8",
+        "ma10": "#a78bfa",
+        "ma20": "#fb923c",
         "selected": "#334155",
     },
 }
+
+
+@dataclass(frozen=True)
+class MarketCandle:
+    timestamp: int
+    label: str
+    open: float
+    high: float
+    low: float
+    close: float
+
+
+def moving_average(candles: list[MarketCandle], period: int) -> list[float | None]:
+    values: list[float | None] = []
+    total = 0.0
+    closes: list[float] = []
+    for candle in candles:
+        closes.append(candle.close)
+        total += candle.close
+        if len(closes) > period:
+            total -= closes[-period - 1]
+        values.append(total / period if len(closes) >= period else None)
+    return values
+
+
+def parse_yahoo_candles(result: dict, limit: int, intraday: bool) -> list[MarketCandle]:
+    timestamps = result.get("timestamp") or []
+    quote_sets = result.get("indicators", {}).get("quote") or []
+    if not quote_sets:
+        return []
+    quote = quote_sets[0]
+    opens = quote.get("open") or []
+    highs = quote.get("high") or []
+    lows = quote.get("low") or []
+    closes = quote.get("close") or []
+    candles: list[MarketCandle] = []
+    for index, timestamp in enumerate(timestamps):
+        try:
+            values = (
+                float(opens[index]),
+                float(highs[index]),
+                float(lows[index]),
+                float(closes[index]),
+            )
+        except (IndexError, TypeError, ValueError):
+            continue
+        local_time = datetime.fromtimestamp(timestamp)
+        label = local_time.strftime("%m/%d %H:%M" if intraday else "%Y-%m-%d")
+        candles.append(MarketCandle(int(timestamp), label, *values))
+    return candles[-max(2, limit):]
+
+
+def aggregate_daily_candles(
+    candles: list[MarketCandle],
+    limit: int,
+) -> list[MarketCandle]:
+    grouped: dict[str, list[MarketCandle]] = {}
+    for candle in candles:
+        date_label = datetime.fromtimestamp(candle.timestamp).strftime("%Y-%m-%d")
+        grouped.setdefault(date_label, []).append(candle)
+    daily: list[MarketCandle] = []
+    for date_label, rows in grouped.items():
+        rows.sort(key=lambda item: item.timestamp)
+        daily.append(
+            MarketCandle(
+                rows[0].timestamp,
+                date_label,
+                rows[0].open,
+                max(item.high for item in rows),
+                min(item.low for item in rows),
+                rows[-1].close,
+            )
+        )
+    daily.sort(key=lambda item: item.timestamp)
+    return daily[-max(2, limit):]
+
+
+def is_taiwan_market_open(now: datetime | None = None) -> bool:
+    current = now or datetime.now()
+    return (
+        current.weekday() < 5
+        and clock_time(9, 0) <= current.time() <= clock_time(13, 35)
+    )
+
+
+def chart_mode_for_time(now: datetime | None = None) -> str:
+    return "intraday" if is_taiwan_market_open(now) else "daily"
+
+
+def chart_mode_for_market_time(
+    api_time: str,
+    now: datetime | None = None,
+) -> str:
+    current = now or datetime.now()
+    mode = chart_mode_for_time(current)
+    if mode != "intraday":
+        return mode
+    date_match = re.search(r"\b(\d{8})\b", api_time)
+    if date_match and date_match.group(1) != current.strftime("%Y%m%d"):
+        return "daily"
+    return mode
+
+
+def fetch_yahoo_candles(
+    symbol: str,
+    timeout: int,
+    retries: int,
+    limit: int,
+    prefer_intraday: bool | None = None,
+) -> tuple[list[MarketCandle], str]:
+    encoded = urllib.parse.quote(symbol, safe="")
+    attempts = max(0, retries) + 1
+    last_error: Exception | None = None
+    intraday = is_taiwan_market_open() if prefer_intraday is None else prefer_intraday
+    plans = (
+        [("5d", "5m", "5 分 K", 8, False)]
+        if intraday
+        else [
+            ("6mo", "1d", "日 K", min(20, limit), False),
+            ("1mo", "30m", "日 K", min(10, limit), True),
+        ]
+    )
+    for range_name, interval, grain, minimum, aggregate_daily in plans:
+        url = (
+            "https://query1.finance.yahoo.com/v8/finance/chart/"
+            f"{encoded}?range={range_name}&interval={interval}"
+        )
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0", "Connection": "close"},
+        )
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                results = payload.get("chart", {}).get("result") or []
+                if not results:
+                    raise RuntimeError(
+                        payload.get("chart", {}).get("error")
+                        or "Yahoo historical chart returned no result"
+                    )
+                candles = parse_yahoo_candles(
+                    results[0],
+                    limit * 20 if aggregate_daily else limit,
+                    intraday=interval != "1d",
+                )
+                if aggregate_daily:
+                    candles = aggregate_daily_candles(candles, limit)
+                if len(candles) >= minimum:
+                    return candles, grain
+            except (OSError, json.JSONDecodeError, RuntimeError) as exc:
+                last_error = exc
+            if attempt < attempts - 1:
+                time.sleep(0.35 * (attempt + 1))
+    if last_error:
+        raise RuntimeError(f"Yahoo 歷史 K 線資料抓取失敗：{last_error}")
+    raise RuntimeError("Yahoo 歷史 K 線資料不足")
+
+
+def draw_candlestick_plot(
+    canvas: tk.Canvas,
+    theme: dict[str, str],
+    candles: list[MarketCandle],
+    previous_close: float | None,
+    left: float,
+    top: float,
+    right: float,
+    bottom: float,
+) -> None:
+    plot_w = max(1.0, right - left)
+    plot_h = max(1.0, bottom - top)
+    if not candles:
+        canvas.create_text(
+            (left + right) / 2,
+            (top + bottom) / 2,
+            text="正在載入歷史 K 線…",
+            fill=theme["muted"],
+            font=("Microsoft JhengHei UI", 10),
+        )
+        return
+
+    averages = {
+        period: moving_average(candles, period)
+        for period in MA_PERIODS
+    }
+    scale_values = [value for candle in candles for value in (candle.high, candle.low)]
+    scale_values.extend(
+        value
+        for values in averages.values()
+        for value in values
+        if value is not None
+    )
+    if previous_close is not None:
+        scale_values.append(previous_close)
+    low = min(scale_values)
+    high = max(scale_values)
+    padding = (high - low) * 0.08 or max(abs(high) * 0.001, 0.1)
+    low -= padding
+    high += padding
+    span = high - low or 1.0
+
+    def y_for(value: float) -> float:
+        return top + (high - value) / span * plot_h
+
+    for band in range(4):
+        band_left = left + band * plot_w / 4
+        band_right = left + (band + 1) * plot_w / 4
+        if band % 2 == 0:
+            canvas.create_rectangle(
+                band_left,
+                top,
+                band_right,
+                bottom,
+                fill=theme["surface"],
+                outline="",
+            )
+
+    for index in range(4):
+        y = top + index * plot_h / 3
+        value = high - index * span / 3
+        canvas.create_line(left, y, right, y, fill=theme["grid"])
+        canvas.create_text(
+            right + 7,
+            y,
+            text=fmt_number(value),
+            fill=theme["muted"],
+            anchor="w",
+            font=("Segoe UI", 8),
+        )
+    canvas.create_line(left, bottom, right, bottom, fill=theme["line"])
+
+    if previous_close is not None and low <= previous_close <= high:
+        baseline_y = y_for(previous_close)
+        canvas.create_line(
+            left,
+            baseline_y,
+            right,
+            baseline_y,
+            fill=theme["muted"],
+            dash=(4, 4),
+        )
+        canvas.create_text(
+            left + 4,
+            baseline_y - 8,
+            text=f"昨收 {fmt_number(previous_close)}",
+            fill=theme["muted"],
+            anchor="w",
+            font=("Microsoft JhengHei UI", 8),
+        )
+
+    step = plot_w / max(1, len(candles))
+    body_width = max(2.0, min(9.0, step * 0.64))
+    for index, candle in enumerate(candles):
+        x = left + (index + 0.5) * step
+        rising = candle.close >= candle.open
+        candle_color = theme["up"] if rising else theme["down"]
+        canvas.create_line(
+            x,
+            y_for(candle.high),
+            x,
+            y_for(candle.low),
+            fill=candle_color,
+            width=1,
+        )
+        open_y = y_for(candle.open)
+        close_y = y_for(candle.close)
+        body_top = min(open_y, close_y)
+        body_bottom = max(open_y, close_y)
+        if body_bottom - body_top < 1.5:
+            body_bottom = body_top + 1.5
+        canvas.create_rectangle(
+            x - body_width / 2,
+            body_top,
+            x + body_width / 2,
+            body_bottom,
+            fill=candle_color,
+            outline=candle_color,
+        )
+
+    for period in MA_PERIODS:
+        coords: list[float] = []
+        for index, value in enumerate(averages[period]):
+            if value is None:
+                continue
+            coords.extend(
+                [
+                    left + (index + 0.5) * step,
+                    y_for(value),
+                ]
+            )
+        if len(coords) >= 4:
+            canvas.create_line(
+                *coords,
+                fill=theme[f"ma{period}"],
+                width=1.6,
+                smooth=True,
+            )
+
+    label_indices = sorted({0, len(candles) // 3, len(candles) * 2 // 3, len(candles) - 1})
+    for index in label_indices:
+        x = left + (index + 0.5) * step
+        canvas.create_text(
+            x,
+            bottom + 12,
+            text=(
+                candles[index].label[5:]
+                if "-" in candles[index].label
+                else candles[index].label
+            ),
+            fill=theme["muted"],
+            anchor="n",
+            font=("Segoe UI", 7),
+        )
+
+    high_index = max(range(len(candles)), key=lambda index: candles[index].high)
+    high_candle = candles[high_index]
+    high_x = left + (high_index + 0.5) * step
+    high_y = y_for(high_candle.high)
+    canvas.create_text(
+        high_x,
+        max(top + 8, high_y - 9),
+        text=fmt_number(high_candle.high),
+        fill=theme["up"],
+        anchor="s",
+        font=("Segoe UI", 8, "bold"),
+    )
+
+    latest = candles[-1].close
+    latest_y = y_for(latest)
+    latest_color = theme["up"] if latest >= candles[-1].open else theme["down"]
+    label = fmt_number(latest)
+    label_width = max(48, 7 * len(label))
+    canvas.create_rectangle(
+        right + 4,
+        latest_y - 9,
+        right + 4 + label_width,
+        latest_y + 9,
+        fill=latest_color,
+        outline=latest_color,
+    )
+    canvas.create_text(
+        right + 8,
+        latest_y,
+        text=label,
+        fill="#ffffff",
+        anchor="w",
+        font=("Segoe UI", 8, "bold"),
+    )
 
 
 def fmt_number(value: float | int | None, digits: int = 2) -> str:
@@ -472,7 +831,9 @@ class StockDynamicApp:
         self.include_etfs = include_etfs
         self.verify_ssl = verify_ssl
         self.history_limit = history_limit
-        self.history: dict[str, list[float]] = defaultdict(list)
+        self.candles: dict[str, list[MarketCandle]] = defaultdict(list)
+        self.candle_grains: dict[str, str] = {}
+        self.chart_mode = ""
         self.index_previous_close: dict[str, float | None] = {}
         self.etf_rows: dict[str, EtfMarketRow] = {}
         self.market_window: MarketOverviewWindow | None = None
@@ -603,7 +964,7 @@ class StockDynamicApp:
         self.chart_panel = ttk.Frame(self.main_pane, style="Card.TFrame", padding=16)
         ttk.Label(
             self.chart_panel,
-            text="四大指數曲線圖",
+            text="四大指數 K 線與均線",
             style="CardTitle.TLabel",
             font=("Microsoft JhengHei UI", 13, "bold"),
         ).pack(anchor="w")
@@ -860,7 +1221,45 @@ class StockDynamicApp:
                 if self.include_etfs
                 else None
             )
-            self.result_queue.put(("data", (quotes, api_time, data_source, all_etfs)))
+            desired_mode = chart_mode_for_market_time(api_time)
+            histories: dict[str, list[MarketCandle]] = {}
+            grains: dict[str, str] = {}
+            if desired_mode != self.chart_mode:
+                for name in INDICES.values():
+                    symbol = YAHOO_SYMBOL_BY_NAME.get(name)
+                    if not symbol:
+                        continue
+                    try:
+                        candles, grain = fetch_yahoo_candles(
+                            symbol,
+                            self.timeout,
+                            self.retries,
+                            self.history_limit,
+                            prefer_intraday=desired_mode == "intraday",
+                        )
+                        histories[name] = candles
+                        grains[name] = grain
+                    except RuntimeError:
+                        if desired_mode == "intraday":
+                            histories[name] = []
+                            grains[name] = "5 分 K（即時建立）"
+                        else:
+                            histories[name] = []
+                            grains[name] = "日 K（即時建立）"
+            self.result_queue.put(
+                (
+                    "data",
+                    (
+                        quotes,
+                        api_time,
+                        data_source,
+                        all_etfs,
+                        histories,
+                        grains,
+                        desired_mode,
+                    ),
+                )
+            )
         except Exception as exc:
             self.result_queue.put(("error", exc))
 
@@ -870,8 +1269,24 @@ class StockDynamicApp:
                 kind, payload = self.result_queue.get_nowait()
                 self.loading = False
                 if kind == "data":
-                    quotes, api_time, data_source, etfs = payload
-                    self.update_market(quotes, api_time, data_source, etfs)
+                    (
+                        quotes,
+                        api_time,
+                        data_source,
+                        etfs,
+                        histories,
+                        grains,
+                        desired_mode,
+                    ) = payload
+                    self.update_market(
+                        quotes,
+                        api_time,
+                        data_source,
+                        etfs,
+                        histories,
+                        grains,
+                        desired_mode,
+                    )
                 else:
                     self.status_text.set(f"更新失敗：{payload}")
         except queue.Empty:
@@ -886,17 +1301,26 @@ class StockDynamicApp:
         api_time: str,
         data_source: str,
         etfs: list[EtfMarketRow] | None,
+        histories: dict[str, list[MarketCandle]] | None = None,
+        grains: dict[str, str] | None = None,
+        desired_mode: str | None = None,
     ) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.status_text.set(f"本機時間：{now}｜行情時間：{api_time or '--'}")
         self.source_text.set(f"來源：{data_source}｜更新頻率：{self.interval} 秒")
 
+        if histories is not None:
+            for name, candles in histories.items():
+                self.candles[name] = candles[-self.history_limit:]
+            self.candle_grains.update(grains or {})
+        if desired_mode:
+            self.chart_mode = desired_mode
+
+        market_date = api_time[:8] if len(api_time) >= 8 and api_time[:8].isdigit() else ""
         for quote in quotes:
             self.index_previous_close[quote.name] = quote.previous_close
             if quote.price is not None:
-                points = self.history[quote.name]
-                points.append(quote.price)
-                del points[:-self.history_limit]
+                self.update_live_candle(quote, market_date)
 
             labels = self.cards.get(quote.name)
             if not labels:
@@ -912,6 +1336,63 @@ class StockDynamicApp:
         self.update_etfs(etfs)
         self.draw_chart()
         self.root.after(self.interval * 1000, self.refresh)
+
+    def update_live_candle(self, quote: IndexQuote, market_date: str) -> None:
+        if quote.price is None:
+            return
+        candles = self.candles[quote.name]
+        grain = self.candle_grains.get(quote.name, "即時 K")
+        if grain.startswith("日 K"):
+            label = (
+                f"{market_date[:4]}-{market_date[4:6]}-{market_date[6:8]}"
+                if len(market_date) == 8
+                else datetime.now().strftime("%Y-%m-%d")
+            )
+            open_value = quote.open_price or (candles[-1].close if candles else quote.price)
+            high_value = quote.high or max(open_value, quote.price)
+            low_value = quote.low or min(open_value, quote.price)
+            live = MarketCandle(
+                int(datetime.now().timestamp()),
+                label,
+                open_value,
+                max(high_value, open_value, quote.price),
+                min(low_value, open_value, quote.price),
+                quote.price,
+            )
+            if candles and candles[-1].label == label:
+                candles[-1] = live
+            else:
+                candles.append(live)
+        else:
+            now = datetime.now()
+            interval_match = re.search(r"(\d+)\s*分", grain)
+            interval_minutes = int(interval_match.group(1)) if interval_match else 5
+            minute = now.minute - now.minute % interval_minutes
+            label = now.replace(minute=minute, second=0).strftime("%m/%d %H:%M")
+            if candles and candles[-1].label == label:
+                current = candles[-1]
+                candles[-1] = MarketCandle(
+                    current.timestamp,
+                    current.label,
+                    current.open,
+                    max(current.high, quote.price),
+                    min(current.low, quote.price),
+                    quote.price,
+                )
+            else:
+                open_value = candles[-1].close if candles else quote.open_price or quote.price
+                candles.append(
+                    MarketCandle(
+                        int(now.timestamp()),
+                        label,
+                        open_value,
+                        max(open_value, quote.price),
+                        min(open_value, quote.price),
+                        quote.price,
+                    )
+                )
+            self.candle_grains.setdefault(quote.name, f"{interval_minutes} 分 K")
+        del candles[:-self.history_limit]
 
     def update_etfs(self, etfs: list[EtfMarketRow] | None) -> None:
         for item in self.etf_tree.get_children():
@@ -986,9 +1467,9 @@ class StockDynamicApp:
         y0 += margin
         x1 -= margin
         y1 -= margin
-        points = self.history.get(name, [])
+        all_candles = self.candles.get(name, [])
         previous_close = self.index_previous_close.get(name)
-        latest_value = points[-1] if points else None
+        latest_value = all_candles[-1].close if all_candles else None
         color = trend_color(theme, latest_value, previous_close)
         canvas.create_rectangle(x0, y0, x1, y1, fill=theme["surface_alt"], outline=theme["line"])
         canvas.create_text(
@@ -1002,7 +1483,10 @@ class StockDynamicApp:
         canvas.create_text(
             x0 + 12,
             y0 + 36,
-            text=pct_text(latest_value, previous_close),
+            text=(
+                f"{pct_text(latest_value, previous_close)}  "
+                f"{self.candle_grains.get(name, 'K 線')}"
+            ),
             fill=color,
             anchor="w",
             font=("Segoe UI", 9, "bold"),
@@ -1018,79 +1502,46 @@ class StockDynamicApp:
             font=("Segoe UI", 12, "bold"),
         )
         canvas.create_text(
+            x1 - 100,
+            y0 + 36,
+            text="MA5",
+            fill=theme["ma5"],
+            anchor="e",
+            font=("Segoe UI", 8, "bold"),
+        )
+        canvas.create_text(
+            x1 - 58,
+            y0 + 36,
+            text="MA10",
+            fill=theme["ma10"],
+            anchor="e",
+            font=("Segoe UI", 8, "bold"),
+        )
+        canvas.create_text(
             x1 - 12,
             y0 + 36,
-            text=f"昨收 {fmt_number(previous_close)}",
-            fill=theme["muted"],
+            text="MA20",
+            fill=theme["ma20"],
             anchor="e",
-            font=("Segoe UI", 8),
+            font=("Segoe UI", 8, "bold"),
         )
 
-        plot_left = x0 + 52
-        plot_right = x1 - 18
+        plot_left = x0 + 10
+        plot_right = x1 - 72
         plot_top = y0 + 54
-        plot_bottom = y1 - 26
+        plot_bottom = y1 - 28
         plot_w = max(1, plot_right - plot_left)
-        plot_h = max(1, plot_bottom - plot_top)
-
-        if len(points) < 2:
-            canvas.create_text(
-                (x0 + x1) / 2,
-                (plot_top + plot_bottom) / 2,
-                text="等待下一次更新後開始繪製",
-                fill=theme["muted"],
-                font=("Microsoft JhengHei UI", 10),
-            )
-            return
-
-        values_for_scale = points + ([previous_close] if previous_close is not None else [])
-        low = min(values_for_scale)
-        high = max(values_for_scale)
-        padding = (high - low) * 0.12 or max(abs(high) * 0.001, 1)
-        low -= padding
-        high += padding
-        span = high - low or 1
-
-        for i in range(3):
-            y = plot_top + i * plot_h / 2
-            value = high - i * span / 2
-            canvas.create_line(plot_left, y, plot_right, y, fill=theme["grid"])
-            canvas.create_text(
-                plot_right + 6,
-                y,
-                text=fmt_number(value),
-                fill=theme["muted"],
-                anchor="w",
-                font=("Segoe UI", 7),
-            )
-
-        canvas.create_line(plot_left, plot_bottom, plot_right, plot_bottom, fill=theme["line"])
-        if previous_close is not None:
-            baseline_y = plot_top + (high - previous_close) / span * plot_h
-            canvas.create_line(plot_left, baseline_y, plot_right, baseline_y, fill=theme["muted"], dash=(3, 4))
-            canvas.create_text(
-                plot_left + 4,
-                baseline_y - 8,
-                text="昨收",
-                fill=theme["muted"],
-                anchor="w",
-                font=("Microsoft JhengHei UI", 8),
-            )
-
-        step = plot_w / max(1, len(points) - 1)
-        coords: list[float] = []
-        for idx, value in enumerate(points):
-            coords.extend([plot_left + idx * step, plot_top + (high - value) / span * plot_h])
-        area_coords = coords + [plot_right, plot_bottom, plot_left, plot_bottom]
-        canvas.create_polygon(*area_coords, fill=trend_fill(theme, latest_value, previous_close), outline="")
-        canvas.create_line(*coords, fill=color, width=2.4, smooth=True)
-        canvas.create_oval(
-            coords[-2] - 3,
-            coords[-1] - 3,
-            coords[-2] + 3,
-            coords[-1] + 3,
-            fill=color,
-            outline=color,
+        max_visible = max(12, min(self.history_limit, int(plot_w / 7)))
+        candles = all_candles[-max_visible:]
+        draw_candlestick_plot(
+            canvas,
+            theme,
+            candles,
+            previous_close,
+            plot_left,
+            plot_top,
+            plot_right,
+            plot_bottom,
         )
 
 
@@ -1387,7 +1838,14 @@ class EtfDetailWindow:
         self.retries = retries
         self.verify_ssl = verify_ssl
         self.theme_getter = theme_getter
-        self.history: list[float] = []
+        self.history_limit = 80
+        self.candles: list[MarketCandle] = []
+        self.candle_grain = (
+            "5 分 K（即時建立）"
+            if is_taiwan_market_open()
+            else "日 K（即時建立）"
+        )
+        self.chart_mode = ""
         self.previous_close: float | None = initial.previous_close
         self.queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.loading = False
@@ -1506,7 +1964,38 @@ class EtfDetailWindow:
 
     def fetch_worker(self) -> None:
         try:
-            self.queue.put(("data", fetch_one_etf_quote(self.code, self.timeout, self.retries, self.verify_ssl)))
+            quote = fetch_one_etf_quote(
+                self.code,
+                self.timeout,
+                self.retries,
+                self.verify_ssl,
+            )
+            desired_mode = chart_mode_for_time()
+            candles: list[MarketCandle] | None = None
+            grain: str | None = None
+            if desired_mode != self.chart_mode:
+                for symbol in (f"{self.code}.TW", f"{self.code}.TWO"):
+                    try:
+                        candles, grain = fetch_yahoo_candles(
+                            symbol,
+                            self.timeout,
+                            self.retries,
+                            self.history_limit,
+                            prefer_intraday=desired_mode == "intraday",
+                        )
+                        break
+                    except RuntimeError:
+                        continue
+                if candles is None:
+                    candles = []
+                    grain = (
+                        "5 分 K（即時建立）"
+                        if desired_mode == "intraday"
+                        else "日 K（即時建立）"
+                    )
+            self.queue.put(
+                ("data", (quote, candles, grain, desired_mode))
+            )
         except Exception as exc:
             self.queue.put(("error", exc))
 
@@ -1516,7 +2005,8 @@ class EtfDetailWindow:
                 kind, payload = self.queue.get_nowait()
                 self.loading = False
                 if kind == "data":
-                    self.update_quote(payload)
+                    quote, candles, grain, desired_mode = payload
+                    self.update_quote(quote, candles, grain, desired_mode)
                 else:
                     self.detail_text.set(f"更新失敗：{payload}")
         except queue.Empty:
@@ -1525,18 +2015,31 @@ class EtfDetailWindow:
         if not self.closed:
             self.window.after(200, self.process_results)
 
-    def update_quote(self, quote: EtfMarketRow) -> None:
+    def update_quote(
+        self,
+        quote: EtfMarketRow,
+        candles: list[MarketCandle] | None = None,
+        grain: str | None = None,
+        desired_mode: str | None = None,
+    ) -> None:
         theme = self.theme_getter()
         self.previous_close = quote.previous_close
+        if candles is not None:
+            self.candles = candles[-self.history_limit:]
+        if grain:
+            self.candle_grain = grain
+        if desired_mode:
+            self.chart_mode = desired_mode
         if quote.price is not None:
-            self.history.append(quote.price)
-            del self.history[:-160]
+            self.update_live_candle(quote)
 
         self.title_text.set(f"{quote.code}  {quote.name}")
         self.price_text.set(fmt_number(quote.price))
         self.change_text.set(f"{fmt_signed(quote.change)} / {fmt_signed(quote.change_percent)}%")
         self.change_label.configure(fg=theme["up"] if (quote.change or 0) >= 0 else theme["down"])
-        self.source_text.set(f"來源：{quote.source}｜時間：{quote.market_time}")
+        self.source_text.set(
+            f"來源：{quote.source}｜時間：{quote.market_time}｜{self.candle_grain}"
+        )
         self.detail_text.set(
             "｜".join(
                 [
@@ -1556,50 +2059,108 @@ class EtfDetailWindow:
         self.apply_theme()
         self.window.after(self.interval * 1000, self.refresh)
 
+    def update_live_candle(self, quote: EtfMarketRow) -> None:
+        if quote.price is None:
+            return
+        now = datetime.now()
+        if self.candle_grain.startswith("日 K"):
+            label = now.strftime("%Y-%m-%d")
+            open_value = quote.open_price or (
+                self.candles[-1].close if self.candles else quote.price
+            )
+            live = MarketCandle(
+                int(now.timestamp()),
+                label,
+                open_value,
+                max(quote.high or quote.price, open_value, quote.price),
+                min(quote.low or quote.price, open_value, quote.price),
+                quote.price,
+            )
+            if self.candles and self.candles[-1].label == label:
+                self.candles[-1] = live
+            else:
+                self.candles.append(live)
+        else:
+            interval_match = re.search(r"(\d+)\s*分", self.candle_grain)
+            interval_minutes = int(interval_match.group(1)) if interval_match else 5
+            minute = now.minute - now.minute % interval_minutes
+            label = now.replace(minute=minute, second=0).strftime("%m/%d %H:%M")
+            if self.candles and self.candles[-1].label == label:
+                current = self.candles[-1]
+                self.candles[-1] = MarketCandle(
+                    current.timestamp,
+                    current.label,
+                    current.open,
+                    max(current.high, quote.price),
+                    min(current.low, quote.price),
+                    quote.price,
+                )
+            else:
+                open_value = (
+                    self.candles[-1].close
+                    if self.candles
+                    else quote.open_price or quote.price
+                )
+                self.candles.append(
+                    MarketCandle(
+                        int(now.timestamp()),
+                        label,
+                        open_value,
+                        max(open_value, quote.price),
+                        min(open_value, quote.price),
+                        quote.price,
+                    )
+                )
+        del self.candles[:-self.history_limit]
+
     def draw_chart(self) -> None:
         theme = self.theme_getter()
         canvas = self.canvas
         canvas.delete("all")
         width = max(canvas.winfo_width(), 420)
         height = max(canvas.winfo_height(), 260)
-        left, right, top, bottom = 62, 28, 28, 44
-        plot_w = width - left - right
-        plot_h = height - top - bottom
-        canvas.create_rectangle(left, top, width - right, height - bottom, fill=theme["surface_alt"], outline=theme["line"])
-
-        if len(self.history) < 2:
-            canvas.create_text(width / 2, height / 2, text="等待下一次更新後開始繪製 ETF 曲線", fill=theme["muted"], font=("Microsoft JhengHei UI", 12))
-            return
-
-        low = min(self.history)
-        values_for_scale = self.history + ([self.previous_close] if self.previous_close is not None else [])
-        low = min(values_for_scale)
-        high = max(values_for_scale)
-        padding = (high - low) * 0.12 or max(abs(high) * 0.001, 0.1)
-        low -= padding
-        high += padding
-        span = high - low or 1
-        color = trend_color(theme, self.history[-1], self.previous_close)
-        for i in range(4):
-            y = top + i * plot_h / 3
-            value = high - i * span / 3
-            canvas.create_line(left, y, width - right, y, fill=theme["grid"])
-            canvas.create_text(width - right + 8, y, text=fmt_number(value), fill=theme["muted"], anchor="w", font=("Segoe UI", 8))
-
-        if self.previous_close is not None:
-            baseline_y = top + (high - self.previous_close) / span * plot_h
-            canvas.create_line(left, baseline_y, width - right, baseline_y, fill=theme["muted"], dash=(3, 4))
-            canvas.create_text(left + 4, baseline_y - 8, text="昨收", fill=theme["muted"], anchor="w", font=("Microsoft JhengHei UI", 8))
-
-        step = plot_w / max(1, len(self.history) - 1)
-        coords: list[float] = []
-        for idx, value in enumerate(self.history):
-            coords.extend([left + idx * step, top + (high - value) / span * plot_h])
-        area_coords = coords + [width - right, height - bottom, left, height - bottom]
-        canvas.create_polygon(*area_coords, fill=trend_fill(theme, self.history[-1], self.previous_close), outline="")
-        canvas.create_line(*coords, fill=color, width=2.5, smooth=True)
-        canvas.create_oval(coords[-2] - 4, coords[-1] - 4, coords[-2] + 4, coords[-1] + 4, fill=color, outline=color)
-        canvas.create_text(width - right, coords[-1] - 10, text=fmt_number(self.history[-1]), fill=color, anchor="e", font=("Segoe UI", 9, "bold"))
+        left, plot_right, top, bottom = 10, width - 76, 34, height - 32
+        canvas.create_rectangle(
+            left,
+            top,
+            plot_right,
+            bottom,
+            fill=theme["surface_alt"],
+            outline=theme["line"],
+        )
+        canvas.create_text(
+            left,
+            16,
+            text=self.candle_grain,
+            fill=theme["muted"],
+            anchor="w",
+            font=("Microsoft JhengHei UI", 9, "bold"),
+        )
+        for x, period in [
+            (plot_right - 104, 5),
+            (plot_right - 58, 10),
+            (plot_right - 8, 20),
+        ]:
+            canvas.create_text(
+                x,
+                16,
+                text=f"MA{period}",
+                fill=theme[f"ma{period}"],
+                anchor="e",
+                font=("Segoe UI", 9, "bold"),
+            )
+        plot_w = max(1, plot_right - left)
+        max_visible = max(20, min(self.history_limit, int(plot_w / 8)))
+        draw_candlestick_plot(
+            canvas,
+            theme,
+            self.candles[-max_visible:],
+            self.previous_close,
+            left,
+            top,
+            plot_right,
+            bottom,
+        )
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -1608,7 +2169,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source", choices=["auto", "twse", "yahoo"], default="auto", help="資料來源。")
     parser.add_argument("--timeout", type=int, default=15, help="網路逾時秒數，預設 15。")
     parser.add_argument("--retries", type=int, default=2, help="連線失敗時重試次數，預設 2。")
-    parser.add_argument("--history", type=int, default=80, help="曲線圖保留資料點數，預設 80。")
+    parser.add_argument("--history", type=int, default=80, help="K 線圖保留資料點數，預設 80。")
     parser.add_argument("--no-etf", action="store_true", help="不顯示 ETF 資料。")
     parser.add_argument("--verify-ssl", action="store_true", help="強制驗證 TWSE SSL 憑證。")
     return parser.parse_args(argv)
