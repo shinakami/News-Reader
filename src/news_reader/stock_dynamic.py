@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import queue
 import re
@@ -12,12 +14,14 @@ import threading
 import time
 import tkinter as tk
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, time as clock_time
+from datetime import datetime, time as clock_time, timedelta, timezone
 from tkinter import ttk
 from typing import Sequence
 import urllib.request
 import urllib.parse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from news_reader.stock_monitor import (
     INDICES,
@@ -38,10 +42,83 @@ CHART_COLORS = {
     "櫃買指數": "#7c3aed",
     "電子類指數": "#0891b2",
     "金融保險類指數": "#ca8a04",
+    "S&P 500": "#2563eb",
+    "道瓊工業": "#7c3aed",
+    "NASDAQ": "#0891b2",
+    "費城半導體": "#ca8a04",
+    "台指近期": "#dc2626",
+    "小型台指近期": "#2563eb",
+    "電子近期": "#0d9488",
+    "金融近期": "#d97706",
 }
 
 YAHOO_SYMBOL_BY_NAME = {name: symbol for symbol, name in YAHOO_INDICES.items()}
 MA_PERIODS = (5, 10, 20)
+
+US_INDEX_SYMBOLS = {
+    "S&P 500": "^GSPC",
+    "道瓊工業": "^DJI",
+    "NASDAQ": "^IXIC",
+    "費城半導體": "^SOX",
+}
+TAIFEX_FRONT_MONTHS = {
+    "台指近期": "TX",
+    "小型台指近期": "MTX",
+    "電子近期": "TE",
+    "金融近期": "TF",
+}
+YAHOO_TW_FUTURE_SYMBOLS = {
+    "台指近期": "WTX&",
+    "小型台指近期": "WMT&",
+    "電子近期": "WTE&",
+    "金融近期": "WTF&",
+}
+US_CHART_NAMES = list(US_INDEX_SYMBOLS)
+TAIWAN_FUTURE_CHART_NAMES = list(YAHOO_TW_FUTURE_SYMBOLS)
+TAIWAN_ADR_SYMBOLS = {
+    "TSM": "台積電 ADR",
+    "UMC": "聯電 ADR",
+    "ASX": "日月光投控 ADR",
+    "CHT": "中華電信 ADR",
+    "AUOTY": "友達 ADR",
+    "BLTE": "Belite Bio ADS",
+    "IMOS": "南茂科技 ADS",
+    "HIMX": "奇景光電 ADS",
+    "SIMO": "慧榮科技 ADS",
+    "VITCY": "威盛科技 ADR（OTC）",
+}
+DEFAULT_US_STOCKS = {
+    "NVDA": "NVIDIA",
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "AMZN": "Amazon",
+    "GOOGL": "Alphabet",
+    "META": "Meta",
+    "TSLA": "Tesla",
+    "AMD": "AMD",
+    "AVGO": "Broadcom",
+    "NFLX": "Netflix",
+    "COST": "Costco",
+}
+DEFAULT_TAIWAN_STOCKS = {
+    "2330": "台積電",
+    "2317": "鴻海",
+    "2454": "聯發科",
+    "2308": "台達電",
+    "2382": "廣達",
+    "2303": "聯電",
+    "3711": "日月光投控",
+    "2412": "中華電",
+    "2881": "富邦金",
+    "2882": "國泰金",
+    "2891": "中信金",
+    "3231": "緯創",
+}
+TAIFEX_HISTORY_URL = "https://www.taifex.com.tw/cht/3/futDataDown"
+YAHOO_TW_CHART_URL = (
+    "https://tw.stock.yahoo.com/_td-stock/api/resource/"
+    "FinanceChartService.ApacLibraCharts"
+)
 
 ETF_LIST_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 ETF_PRODUCTS_URL = "https://www.twse.com.tw/zh/ETFortune/ajaxProductsResult"
@@ -52,29 +129,8 @@ ETF_CODE_PATTERN = re.compile(r"^00[0-9A-Z]+$")
 ETF_BATCH_SIZE = 45
 
 THEMES = {
-    "day": {
-        "label": "白天",
-        "next_label": "切換深夜",
-        "bg": "#eef2f6",
-        "surface": "#ffffff",
-        "surface_alt": "#f8fafc",
-        "text": "#1d252d",
-        "muted": "#64748b",
-        "line": "#d7dee8",
-        "grid": "#e8edf3",
-        "up": "#b42318",
-        "down": "#067647",
-        "up_fill": "#fee2e2",
-        "down_fill": "#dcfce7",
-        "accent": "#2563eb",
-        "ma5": "#38bdf8",
-        "ma10": "#7c3aed",
-        "ma20": "#ea580c",
-        "selected": "#dbeafe",
-    },
     "night": {
         "label": "深夜",
-        "next_label": "切換白天",
         "bg": "#111827",
         "surface": "#1f2937",
         "surface_alt": "#111827",
@@ -103,6 +159,33 @@ class MarketCandle:
     high: float
     low: float
     close: float
+
+
+@dataclass(frozen=True)
+class SecurityQuote:
+    symbol: str
+    name: str
+    price: float | None
+    previous_close: float | None
+    open_price: float | None
+    high: float | None
+    low: float | None
+    volume: int | None
+    market_time: str
+    market_timestamp: int | None = None
+    source: str = "Yahoo Finance"
+
+    @property
+    def change(self) -> float | None:
+        if self.price is None or self.previous_close is None:
+            return None
+        return self.price - self.previous_close
+
+    @property
+    def change_percent(self) -> float | None:
+        if self.change is None or not self.previous_close:
+            return None
+        return self.change / self.previous_close * 100
 
 
 def moving_average(candles: list[MarketCandle], period: int) -> list[float | None]:
@@ -196,6 +279,72 @@ def chart_mode_for_market_time(
     return mode
 
 
+def us_eastern_timezone(current: datetime) -> timezone | ZoneInfo:
+    try:
+        return ZoneInfo("America/New_York")
+    except ZoneInfoNotFoundError:
+        current_utc = current.astimezone(timezone.utc)
+        year = current_utc.year
+
+        march_first = datetime(year, 3, 1, tzinfo=timezone.utc)
+        first_march_sunday = 1 + (6 - march_first.weekday()) % 7
+        second_march_sunday = first_march_sunday + 7
+        dst_start = datetime(
+            year,
+            3,
+            second_march_sunday,
+            7,
+            tzinfo=timezone.utc,
+        )
+
+        november_first = datetime(year, 11, 1, tzinfo=timezone.utc)
+        first_november_sunday = 1 + (6 - november_first.weekday()) % 7
+        dst_end = datetime(
+            year,
+            11,
+            first_november_sunday,
+            6,
+            tzinfo=timezone.utc,
+        )
+        offset_hours = -4 if dst_start <= current_utc < dst_end else -5
+        return timezone(timedelta(hours=offset_hours))
+
+
+def is_us_market_open(now: datetime | None = None) -> bool:
+    current = now or datetime.now().astimezone()
+    if current.tzinfo is None:
+        current = current.astimezone()
+    eastern = current.astimezone(us_eastern_timezone(current))
+    return (
+        eastern.weekday() < 5
+        and clock_time(9, 30) <= eastern.time().replace(tzinfo=None) <= clock_time(16, 5)
+    )
+
+
+def chart_mode_for_us_time(now: datetime | None = None) -> str:
+    return "intraday" if is_us_market_open(now) else "daily"
+
+
+def chart_mode_for_us_quotes(
+    quotes: list[SecurityQuote],
+    now: datetime | None = None,
+) -> str:
+    current = now or datetime.now().astimezone()
+    mode = chart_mode_for_us_time(current)
+    if mode != "intraday":
+        return mode
+    eastern_zone = us_eastern_timezone(current)
+    expected_date = current.astimezone(eastern_zone).date()
+    quote_dates = {
+        datetime.fromtimestamp(quote.market_timestamp, eastern_zone).date()
+        for quote in quotes
+        if quote.market_timestamp
+    }
+    if quote_dates and expected_date not in quote_dates:
+        return "daily"
+    return mode
+
+
 def fetch_yahoo_candles(
     symbol: str,
     timeout: int,
@@ -250,6 +399,426 @@ def fetch_yahoo_candles(
     if last_error:
         raise RuntimeError(f"Yahoo 歷史 K 線資料抓取失敗：{last_error}")
     raise RuntimeError("Yahoo 歷史 K 線資料不足")
+
+
+def fetch_yahoo_security_quote(
+    symbol: str,
+    display_name: str,
+    timeout: int,
+    retries: int,
+) -> SecurityQuote:
+    encoded = urllib.parse.quote(symbol, safe="")
+    url = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/"
+        f"{encoded}?range=1d&interval=1m"
+    )
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0", "Connection": "close"},
+    )
+    attempts = max(0, retries) + 1
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            results = payload.get("chart", {}).get("result") or []
+            if not results:
+                raise RuntimeError(
+                    payload.get("chart", {}).get("error")
+                    or "Yahoo quote returned no result"
+                )
+            result = results[0]
+            meta = result.get("meta", {})
+            quote_sets = result.get("indicators", {}).get("quote") or []
+            closes = (quote_sets[0].get("close") or []) if quote_sets else []
+            price = to_float(str(meta.get("regularMarketPrice", "")))
+            if price is None:
+                valid_closes = [value for value in closes if value is not None]
+                price = float(valid_closes[-1]) if valid_closes else None
+            timestamp = meta.get("regularMarketTime")
+            market_time = "--"
+            if timestamp:
+                market_time = datetime.fromtimestamp(timestamp).strftime("%m/%d %H:%M")
+            return SecurityQuote(
+                symbol=symbol,
+                name=display_name or meta.get("shortName") or symbol,
+                price=price,
+                previous_close=to_float(
+                    str(
+                        meta.get("chartPreviousClose")
+                        or meta.get("previousClose")
+                        or ""
+                    )
+                ),
+                open_price=to_float(str(meta.get("regularMarketOpen", ""))),
+                high=to_float(str(meta.get("regularMarketDayHigh", ""))),
+                low=to_float(str(meta.get("regularMarketDayLow", ""))),
+                volume=to_int(str(meta.get("regularMarketVolume", ""))),
+                market_time=market_time,
+                market_timestamp=int(timestamp) if timestamp else None,
+            )
+        except (OSError, json.JSONDecodeError, RuntimeError) as exc:
+            last_error = exc
+        if attempt < attempts - 1:
+            time.sleep(0.25 * (attempt + 1))
+    raise RuntimeError(f"{symbol} Yahoo 行情載入失敗：{last_error}")
+
+
+def fetch_yahoo_security_quotes(
+    symbols: dict[str, str],
+    timeout: int,
+    retries: int,
+) -> list[SecurityQuote]:
+    if not symbols:
+        return []
+    rows: dict[str, SecurityQuote] = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as executor:
+        futures = {
+            executor.submit(
+                fetch_yahoo_security_quote,
+                symbol,
+                name,
+                timeout,
+                retries,
+            ): (symbol, name)
+            for symbol, name in symbols.items()
+        }
+        for future in as_completed(futures):
+            symbol, name = futures[future]
+            try:
+                rows[symbol] = future.result()
+            except RuntimeError:
+                rows[symbol] = SecurityQuote(
+                    symbol=symbol,
+                    name=name,
+                    price=None,
+                    previous_close=None,
+                    open_price=None,
+                    high=None,
+                    low=None,
+                    volume=None,
+                    market_time="--",
+                    market_timestamp=None,
+                    source="Yahoo Finance（暫無資料）",
+                )
+    return [rows[symbol] for symbol in symbols]
+
+
+def fetch_taiwan_security_quote(
+    code: str,
+    display_name: str,
+    timeout: int,
+    retries: int,
+) -> SecurityQuote:
+    requested_name = "" if display_name == code else display_name
+    for symbol in (f"{code}.TW", f"{code}.TWO"):
+        try:
+            return fetch_yahoo_security_quote(
+                symbol,
+                requested_name,
+                timeout,
+                retries,
+            )
+        except RuntimeError:
+            continue
+    return SecurityQuote(
+        symbol=f"{code}.TW",
+        name=display_name or code,
+        price=None,
+        previous_close=None,
+        open_price=None,
+        high=None,
+        low=None,
+        volume=None,
+        market_time="--",
+        market_timestamp=None,
+        source="Yahoo Finance（暫無資料）",
+    )
+
+
+def fetch_taiwan_security_quotes(
+    symbols: dict[str, str],
+    timeout: int,
+    retries: int,
+) -> dict[str, SecurityQuote]:
+    if not symbols:
+        return {}
+    rows: dict[str, SecurityQuote] = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as executor:
+        futures = {
+            executor.submit(
+                fetch_taiwan_security_quote,
+                code,
+                name,
+                timeout,
+                retries,
+            ): code
+            for code, name in symbols.items()
+        }
+        for future in as_completed(futures):
+            code = futures[future]
+            rows[code] = future.result()
+    return rows
+
+
+def fetch_yahoo_tw_futures(
+    symbols: dict[str, str],
+    timeout: int,
+    retries: int,
+    limit: int,
+) -> tuple[
+    dict[str, list[MarketCandle]],
+    dict[str, str],
+    dict[str, float | None],
+    list[str],
+    list[str],
+]:
+    """Fetch Taiwan futures quotes and 5-minute candles in one Yahoo TW batch."""
+    encoded_symbols = urllib.parse.quote(
+        json.dumps(list(symbols.values()), ensure_ascii=False, separators=(",", ":")),
+        safe="",
+    )
+    resource = (
+        f"{YAHOO_TW_CHART_URL};autoRefresh={int(time.time() * 1000)}"
+        f";period=5m;range=1d;symbols={encoded_symbols};type=null"
+    )
+    query = urllib.parse.urlencode(
+        {
+            "device": "desktop",
+            "ecma": "modern",
+            "intl": "tw",
+            "lang": "zh-Hant-TW",
+            "region": "TW",
+            "site": "finance",
+            "tz": "Asia/Taipei",
+            "returnMeta": "true",
+        }
+    )
+    request = urllib.request.Request(
+        f"{resource}?{query}",
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://tw.stock.yahoo.com/future/",
+            "Cache-Control": "no-cache",
+            "Connection": "close",
+        },
+    )
+    attempts = max(0, retries) + 1
+    payload: dict | None = None
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            break
+        except (OSError, json.JSONDecodeError) as exc:
+            last_error = exc
+        if attempt < attempts - 1:
+            time.sleep(0.35 * (attempt + 1))
+    if payload is None:
+        raise RuntimeError(f"Yahoo 台灣期貨行情載入失敗：{last_error}")
+
+    by_symbol = {
+        item.get("symbol"): item
+        for item in payload.get("data") or []
+        if item.get("symbol")
+    }
+    histories: dict[str, list[MarketCandle]] = {}
+    grains: dict[str, str] = {}
+    previous_closes: dict[str, float | None] = {}
+    refreshed_times: list[str] = []
+    errors: list[str] = []
+
+    for name, symbol in symbols.items():
+        item = by_symbol.get(symbol)
+        if not item:
+            histories[name] = []
+            grains[name] = "Yahoo 5 分 K（暫無資料）"
+            previous_closes[name] = None
+            errors.append(f"{name}：Yahoo 未回傳資料")
+            continue
+        chart = item.get("chart") or {}
+        meta = chart.get("meta") or {}
+        quote = chart.get("quote") or {}
+        candles = parse_yahoo_candles(chart, limit, intraday=True)
+        price = to_float(str(quote.get("price") or ""))
+        previous_close = to_float(
+            str(
+                quote.get("previousClose")
+                or meta.get("chartPreviousClose")
+                or meta.get("previousClose")
+                or ""
+            )
+        )
+        refreshed_text = str(quote.get("refreshedTs") or "")
+        timestamp = meta.get("regularMarketTime")
+        if refreshed_text and refreshed_text != "-":
+            refreshed_times.append(refreshed_text)
+            try:
+                timestamp = int(
+                    datetime.fromisoformat(
+                        refreshed_text.replace("Z", "+00:00")
+                    ).timestamp()
+                )
+            except ValueError:
+                pass
+
+        if timestamp and candles and abs(candles[-1].timestamp - timestamp) > 43_200:
+            latest_bucket = int(timestamp) - int(timestamp) % 300
+            shift = latest_bucket - candles[-1].timestamp
+            candles = [
+                MarketCandle(
+                    candle.timestamp + shift,
+                    datetime.fromtimestamp(candle.timestamp + shift).strftime(
+                        "%m/%d %H:%M"
+                    ),
+                    candle.open,
+                    candle.high,
+                    candle.low,
+                    candle.close,
+                )
+                for candle in candles
+            ]
+
+        if price is not None and candles:
+            latest = candles[-1]
+            candles[-1] = MarketCandle(
+                latest.timestamp,
+                latest.label,
+                latest.open,
+                max(latest.high, price),
+                min(latest.low, price),
+                price,
+            )
+        elif price is not None:
+            open_price = to_float(str(quote.get("openPrice") or "")) or price
+            high = to_float(str(quote.get("dayHighPrice") or "")) or price
+            low = to_float(str(quote.get("dayLowPrice") or "")) or price
+            moment = datetime.fromtimestamp(timestamp) if timestamp else datetime.now()
+            candles = [
+                MarketCandle(
+                    int(moment.timestamp()),
+                    moment.strftime("%m/%d %H:%M"),
+                    open_price,
+                    max(high, open_price, price),
+                    min(low, open_price, price),
+                    price,
+                )
+            ]
+
+        histories[name] = candles[-max(2, limit):]
+        grains[name] = (
+            "Yahoo 5 分 K"
+            if candles
+            else "Yahoo 5 分 K（暫無成交）"
+        )
+        previous_closes[name] = previous_close
+        if not candles:
+            errors.append(f"{name}：目前沒有盤中成交資料")
+
+    return histories, grains, previous_closes, refreshed_times, errors
+
+
+def fetch_taifex_front_month_candles(
+    contract: str,
+    timeout: int,
+    retries: int,
+    verify_ssl: bool,
+    limit: int,
+) -> tuple[list[MarketCandle], str]:
+    end_date = datetime.now().date()
+    start_date = end_date - timedelta(days=30)
+    form = urllib.parse.urlencode(
+        {
+            "down_type": "1",
+            "queryStartDate": start_date.strftime("%Y/%m/%d"),
+            "queryEndDate": end_date.strftime("%Y/%m/%d"),
+            "commodity_id": contract,
+            "commodity_id2": "",
+        }
+    ).encode()
+    request = urllib.request.Request(
+        TAIFEX_HISTORY_URL,
+        data=form,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": "https://www.taifex.com.tw/cht/3/futDailyMarketView",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+    )
+    attempts = max(0, retries) + 1
+    raw = b""
+    last_error: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=timeout,
+                context=make_context(verify_ssl),
+            ) as response:
+                raw = response.read()
+            break
+        except OSError as exc:
+            last_error = exc
+        if attempt < attempts - 1:
+            time.sleep(0.35 * (attempt + 1))
+    if not raw:
+        raise RuntimeError(f"TAIFEX {contract} 近月資料下載失敗：{last_error}")
+    text = raw.decode("cp950", errors="replace")
+    rows = csv.DictReader(io.StringIO(text))
+    grouped: dict[str, dict[str, list[dict[str, str]]]] = defaultdict(
+        lambda: defaultdict(list)
+    )
+    for row in rows:
+        if (row.get("契約") or "").strip() != contract:
+            continue
+        date_text = (row.get("交易日期") or "").strip()
+        month = (row.get("到期月份(週別)") or "").strip()
+        values = [
+            to_float(row.get("開盤價")),
+            to_float(row.get("最高價")),
+            to_float(row.get("最低價")),
+            to_float(row.get("收盤價")),
+        ]
+        if not date_text or not re.fullmatch(r"\d{6}", month) or any(
+            value is None for value in values
+        ):
+            continue
+        grouped[date_text][month].append(row)
+
+    candles: list[MarketCandle] = []
+    latest_month = ""
+    for date_text in sorted(grouped):
+        months = sorted(grouped[date_text])
+        if not months:
+            continue
+        front_month = months[0]
+        sessions = grouped[date_text][front_month]
+        night = [row for row in sessions if "盤後" in (row.get("交易時段") or "")]
+        regular = [row for row in sessions if "一般" in (row.get("交易時段") or "")]
+        ordered = [*night, *regular] or sessions
+        opens = [to_float(row.get("開盤價")) for row in ordered]
+        highs = [to_float(row.get("最高價")) for row in ordered]
+        lows = [to_float(row.get("最低價")) for row in ordered]
+        closes = [to_float(row.get("收盤價")) for row in ordered]
+        if any(value is None for value in [*opens, *highs, *lows, *closes]):
+            continue
+        local_date = datetime.strptime(date_text, "%Y/%m/%d")
+        candles.append(
+            MarketCandle(
+                int(local_date.timestamp()),
+                local_date.strftime("%Y-%m-%d"),
+                opens[0],
+                max(highs),
+                min(lows),
+                closes[-1],
+            )
+        )
+        latest_month = front_month
+    if len(candles) < 2:
+        raise RuntimeError(f"TAIFEX {contract} 近月歷史資料不足")
+    return candles[-max(2, limit):], f"{latest_month} 近月日 K"
 
 
 def draw_candlestick_plot(
@@ -508,6 +1077,26 @@ class EtfMarketRow:
         if self.change is None or not self.previous_close:
             return None
         return self.change / self.previous_close * 100
+
+
+def security_quote_to_market_row(
+    code: str,
+    quote: SecurityQuote,
+) -> EtfMarketRow:
+    return EtfMarketRow(
+        code=code,
+        name=quote.name,
+        price=quote.price,
+        previous_close=quote.previous_close,
+        open_price=quote.open_price,
+        high=quote.high,
+        low=quote.low,
+        volume=quote.volume,
+        trade_value=None,
+        transaction=None,
+        market_time=quote.market_time,
+        source=quote.source,
+    )
 
 
 @dataclass(frozen=True)
@@ -836,12 +1425,23 @@ class StockDynamicApp:
         self.chart_mode = ""
         self.index_previous_close: dict[str, float | None] = {}
         self.etf_rows: dict[str, EtfMarketRow] = {}
+        self.tw_stock_symbols = dict(DEFAULT_TAIWAN_STOCKS)
+        self.tw_stock_rows: dict[str, SecurityQuote] = {}
+        self.active_page = "taiwan"
+        self.us_candles: dict[str, list[MarketCandle]] = defaultdict(list)
+        self.us_candle_grains: dict[str, str] = {}
+        self.us_chart_mode = ""
+        self.us_previous_close: dict[str, float | None] = {}
+        self.us_stock_symbols = dict(DEFAULT_US_STOCKS)
+        self.us_history_loaded_at = 0.0
         self.market_window: MarketOverviewWindow | None = None
+        self.futures_window: TaiwanFuturesWindow | None = None
         self.result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.loading = False
+        self.loading_page = ""
+        self.refresh_job: str | None = None
         self.closed = False
-        self.applying_theme = False
-        self.theme_name = "day"
+        self.theme_name = "night"
         self.theme = THEMES[self.theme_name]
 
         self.root.title("Stock Dynamic")
@@ -852,7 +1452,8 @@ class StockDynamicApp:
 
         self.status_text = tk.StringVar(value="正在載入行情...")
         self.source_text = tk.StringVar(value=f"來源：{source}")
-        self.theme_button_text = tk.StringVar(value=self.theme["next_label"])
+        self.subtitle_text = tk.StringVar(value="台股四大指數、ETF 與個股即時看板")
+        self.market_page_button_text = tk.StringVar(value="切換美股")
         self.style = ttk.Style()
         self.card_widgets: list[ttk.Frame] = []
         self.current_layout: tuple[int, bool] | None = None
@@ -880,7 +1481,7 @@ class StockDynamicApp:
         title.grid(row=0, column=0, sticky="w")
         subtitle = ttk.Label(
             header_inner,
-            text="台股四大指數與 ETF 即時看板",
+            textvariable=self.subtitle_text,
             style="Muted.TLabel",
             font=("Microsoft JhengHei UI", 10),
         )
@@ -905,12 +1506,35 @@ class StockDynamicApp:
             style="Flat.TButton",
             command=self.open_market_overview,
         ).pack(side="left", padx=(0, 8))
-        ttk.Button(actions, textvariable=self.theme_button_text, style="Flat.TButton", command=self.toggle_theme).pack(side="left", padx=(0, 8))
-        refresh_button = ttk.Button(actions, text="立即更新", style="Flat.TButton", command=self.refresh)
+        ttk.Button(
+            actions,
+            text="台指期貨",
+            style="Flat.TButton",
+            command=self.open_taiwan_futures,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            actions,
+            textvariable=self.market_page_button_text,
+            style="Flat.TButton",
+            command=self.switch_market_page,
+        ).pack(side="left", padx=(0, 8))
+        refresh_button = ttk.Button(
+            actions,
+            text="立即更新",
+            style="Flat.TButton",
+            command=self.refresh_all,
+        )
         refresh_button.pack(side="left")
         header_inner.columnconfigure(0, weight=1)
 
-        self.card_frame = ttk.Frame(self.root, style="TFrame")
+        self.page_host = ttk.Frame(self.root, style="TFrame")
+        self.page_host.pack(fill="both", expand=True)
+        self.page_host.rowconfigure(0, weight=1)
+        self.page_host.columnconfigure(0, weight=1)
+        self.taiwan_page = ttk.Frame(self.page_host, style="TFrame")
+        self.taiwan_page.grid(row=0, column=0, sticky="nsew")
+
+        self.card_frame = ttk.Frame(self.taiwan_page, style="TFrame")
         self.card_frame.pack(fill="x", padx=16, pady=8)
         self.cards: dict[str, dict[str, ttk.Label]] = {}
         for idx, name in enumerate(INDICES.values()):
@@ -944,7 +1568,7 @@ class StockDynamicApp:
             self.cards[name] = {"value": value, "change": change, "time": time_label, "accent": accent}
             self.card_frame.columnconfigure(idx, weight=1, uniform="cards")
 
-        self.body = ttk.Frame(self.root, style="TFrame")
+        self.body = ttk.Frame(self.taiwan_page, style="TFrame")
         self.body.pack(fill="both", expand=True, padx=16, pady=(4, 16))
         self.body.columnconfigure(0, weight=3)
         self.body.columnconfigure(1, weight=2)
@@ -1010,8 +1634,22 @@ class StockDynamicApp:
         self.right_panel.rowconfigure(0, weight=1)
         self.right_panel.columnconfigure(0, weight=1)
 
-        self.etf_panel = ttk.Frame(self.right_panel, style="Card.TFrame", padding=16)
-        self.etf_panel.grid(row=0, column=0, sticky="nsew")
+        self.taiwan_tables_pane = tk.PanedWindow(
+            self.right_panel,
+            orient="vertical",
+            sashwidth=7,
+            sashrelief="raised",
+            showhandle=True,
+            bd=0,
+            opaqueresize=True,
+        )
+        self.taiwan_tables_pane.grid(row=0, column=0, sticky="nsew")
+
+        self.etf_panel = ttk.Frame(
+            self.taiwan_tables_pane,
+            style="Card.TFrame",
+            padding=16,
+        )
         ttk.Label(
             self.etf_panel,
             text="台灣上市 ETF",
@@ -1065,12 +1703,356 @@ class StockDynamicApp:
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
         self.etf_tree.bind("<Double-1>", self.open_selected_etf)
+
+        self.tw_stock_panel = ttk.Frame(
+            self.taiwan_tables_pane,
+            style="Card.TFrame",
+            padding=16,
+        )
+        tw_stock_header = ttk.Frame(self.tw_stock_panel, style="Card.TFrame")
+        tw_stock_header.pack(fill="x")
+        ttk.Label(
+            tw_stock_header,
+            text="台股個股",
+            style="CardTitle.TLabel",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+        ).pack(side="left")
+        self.tw_stock_text = tk.StringVar()
+        ttk.Entry(
+            tw_stock_header,
+            textvariable=self.tw_stock_text,
+            width=10,
+        ).pack(side="right", padx=(6, 0))
+        ttk.Button(
+            tw_stock_header,
+            text="加入代號",
+            style="Flat.TButton",
+            command=self.add_taiwan_stock_symbol,
+        ).pack(side="right")
+        ttk.Label(
+            self.tw_stock_panel,
+            text="預載大型個股；可輸入上市或上櫃代號，雙擊開啟 K 線",
+            style="Muted.TLabel",
+            font=("Microsoft JhengHei UI", 8),
+        ).pack(anchor="w", pady=(2, 6))
+        self.tw_stock_tree = self.create_taiwan_stock_tree(self.tw_stock_panel)
+        self.tw_stock_tree.bind("<Double-1>", self.open_selected_taiwan_stock)
+
+        self.taiwan_tables_pane.add(
+            self.etf_panel,
+            stretch="always",
+            minsize=210,
+        )
+        self.taiwan_tables_pane.add(
+            self.tw_stock_panel,
+            stretch="always",
+            minsize=190,
+        )
         self.main_pane.add(self.chart_panel, stretch="always", minsize=360)
         self.main_pane.add(self.right_panel, stretch="always", minsize=360)
+        self.build_us_page()
+        self.taiwan_page.tkraise()
         self.layout_for_width(self.root.winfo_width() or 1240)
 
+    def create_taiwan_stock_tree(self, parent: ttk.Frame) -> ttk.Treeview:
+        table_frame = ttk.Frame(parent, style="Card.TFrame")
+        table_frame.pack(fill="both", expand=True)
+        columns = (
+            "code",
+            "name",
+            "price",
+            "change",
+            "percent",
+            "volume",
+            "time",
+            "source",
+        )
+        tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            height=8,
+        )
+        scrollbar = ttk.Scrollbar(
+            table_frame,
+            orient="vertical",
+            command=tree.yview,
+        )
+        xscrollbar = ttk.Scrollbar(
+            table_frame,
+            orient="horizontal",
+            command=tree.xview,
+        )
+        tree.configure(
+            yscrollcommand=scrollbar.set,
+            xscrollcommand=xscrollbar.set,
+        )
+        headings = {
+            "code": "代號",
+            "name": "名稱",
+            "price": "現價",
+            "change": "漲跌",
+            "percent": "%",
+            "volume": "成交量",
+            "time": "時間",
+            "source": "來源",
+        }
+        widths = {
+            "code": 68,
+            "name": 140,
+            "price": 82,
+            "change": 82,
+            "percent": 70,
+            "volume": 100,
+            "time": 92,
+            "source": 110,
+        }
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], anchor="e")
+        tree.column("code", anchor="w")
+        tree.column("name", anchor="w")
+        tree.column("source", anchor="w")
+        tree.tag_configure("up", foreground=self.theme["up"])
+        tree.tag_configure("down", foreground=self.theme["down"])
+        tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        xscrollbar.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        return tree
+
+    def build_us_page(self) -> None:
+        self.us_page = ttk.Frame(self.page_host, style="TFrame")
+        self.us_page.grid(row=0, column=0, sticky="nsew")
+
+        self.us_card_frame = ttk.Frame(self.us_page, style="TFrame")
+        self.us_card_frame.pack(fill="x", padx=16, pady=8)
+        self.us_cards: dict[str, dict[str, ttk.Label | tk.Frame]] = {}
+        self.us_card_widgets: list[ttk.Frame] = []
+        for index, name in enumerate(US_INDEX_SYMBOLS):
+            frame = ttk.Frame(self.us_card_frame, style="Card.TFrame", padding=16)
+            frame.grid(
+                row=0,
+                column=index,
+                sticky="nsew",
+                padx=(0 if index == 0 else 10, 0),
+            )
+            self.us_card_widgets.append(frame)
+            accent = tk.Frame(
+                frame,
+                height=4,
+                bg=CHART_COLORS.get(name, self.theme["accent"]),
+            )
+            accent.pack(fill="x", side="top", pady=(0, 12))
+            ttk.Label(
+                frame,
+                text=name,
+                style="CardTitle.TLabel",
+                font=("Microsoft JhengHei UI", 11, "bold"),
+            ).pack(anchor="w")
+            value = ttk.Label(
+                frame,
+                text="--",
+                style="CardValue.TLabel",
+                font=("Segoe UI", 25, "bold"),
+            )
+            value.pack(anchor="w", pady=(10, 2))
+            change = ttk.Label(
+                frame,
+                text="--",
+                style="Muted.TLabel",
+                font=("Segoe UI", 11, "bold"),
+            )
+            change.pack(anchor="w")
+            time_label = ttk.Label(frame, text="--", style="Muted.TLabel")
+            time_label.pack(anchor="w", pady=(8, 0))
+            self.us_cards[name] = {
+                "value": value,
+                "change": change,
+                "time": time_label,
+                "accent": accent,
+            }
+            self.us_card_frame.columnconfigure(index, weight=1, uniform="us_cards")
+
+        self.us_main_pane = tk.PanedWindow(
+            self.us_page,
+            orient="horizontal",
+            sashwidth=8,
+            sashrelief="raised",
+            showhandle=True,
+            bd=0,
+            opaqueresize=True,
+        )
+        self.us_main_pane.pack(fill="both", expand=True, padx=16, pady=(4, 16))
+
+        self.us_chart_panel = ttk.Frame(
+            self.us_main_pane,
+            style="Card.TFrame",
+            padding=16,
+        )
+        ttk.Label(
+            self.us_chart_panel,
+            text="美股四大指數 K 線",
+            style="CardTitle.TLabel",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            self.us_chart_panel,
+            text="美股開盤顯示 5 分 K，休市後自動切換日 K",
+            style="Muted.TLabel",
+            font=("Microsoft JhengHei UI", 9),
+        ).pack(anchor="w", pady=(2, 6))
+        self.us_chart_grid = ttk.Frame(self.us_chart_panel, style="Card.TFrame")
+        self.us_chart_grid.pack(fill="both", expand=True)
+        self.us_chart_canvases: dict[str, tk.Canvas] = {}
+        for index, name in enumerate(US_CHART_NAMES):
+            row = index // 2
+            column = index % 2
+            canvas = tk.Canvas(
+                self.us_chart_grid,
+                bg=self.theme["surface"],
+                highlightthickness=0,
+                height=120,
+                width=280,
+            )
+            canvas.grid(
+                row=row,
+                column=column,
+                sticky="nsew",
+                padx=(0 if column == 0 else 4, 4 if column == 0 else 0),
+                pady=(0 if row == 0 else 4, 0),
+            )
+            canvas.bind(
+                "<Configure>",
+                lambda _event, chart_name=name: self.draw_one_us_chart(chart_name),
+            )
+            self.us_chart_canvases[name] = canvas
+        for column in range(2):
+            self.us_chart_grid.columnconfigure(column, weight=1, uniform="us_charts")
+        for row in range(2):
+            self.us_chart_grid.rowconfigure(row, weight=1, uniform="us_charts")
+
+        self.us_tables_pane = tk.PanedWindow(
+            self.us_main_pane,
+            orient="vertical",
+            sashwidth=7,
+            sashrelief="raised",
+            showhandle=True,
+            bd=0,
+            opaqueresize=True,
+        )
+        adr_panel = ttk.Frame(self.us_tables_pane, style="Card.TFrame", padding=14)
+        ttk.Label(
+            adr_panel,
+            text="台灣企業 ADR／ADS（完整清單）",
+            style="CardTitle.TLabel",
+            font=("Microsoft JhengHei UI", 12, "bold"),
+        ).pack(anchor="w")
+        ttk.Label(
+            adr_panel,
+            text="美國交易所與 OTC 市場共 10 檔；無即時行情時仍保留代號",
+            style="Muted.TLabel",
+            font=("Microsoft JhengHei UI", 8),
+        ).pack(anchor="w", pady=(2, 6))
+        self.adr_tree = self.create_security_tree(adr_panel)
+
+        stocks_panel = ttk.Frame(
+            self.us_tables_pane,
+            style="Card.TFrame",
+            padding=14,
+        )
+        stock_header = ttk.Frame(stocks_panel, style="Card.TFrame")
+        stock_header.pack(fill="x")
+        ttk.Label(
+            stock_header,
+            text="美國個股（常用＋自訂）",
+            style="CardTitle.TLabel",
+            font=("Microsoft JhengHei UI", 12, "bold"),
+        ).pack(side="left")
+        self.us_symbol_text = tk.StringVar()
+        ttk.Entry(
+            stock_header,
+            textvariable=self.us_symbol_text,
+            width=12,
+        ).pack(side="right", padx=(6, 0))
+        ttk.Button(
+            stock_header,
+            text="加入代號",
+            style="Flat.TButton",
+            command=self.add_us_stock_symbol,
+        ).pack(side="right")
+        ttk.Label(
+            stocks_panel,
+            text="預載大型個股；可加入任一 Yahoo 美股代號，例如 PLTR、BRK-B",
+            style="Muted.TLabel",
+            font=("Microsoft JhengHei UI", 8),
+        ).pack(anchor="w", pady=(2, 6))
+        self.us_stock_tree = self.create_security_tree(stocks_panel)
+
+        self.us_tables_pane.add(adr_panel, stretch="always", minsize=170)
+        self.us_tables_pane.add(stocks_panel, stretch="always", minsize=210)
+        self.us_main_pane.add(self.us_chart_panel, stretch="always", minsize=440)
+        self.us_main_pane.add(self.us_tables_pane, stretch="always", minsize=380)
+
+    def create_security_tree(self, parent: ttk.Frame) -> ttk.Treeview:
+        table_frame = ttk.Frame(parent, style="Card.TFrame")
+        table_frame.pack(fill="both", expand=True)
+        columns = (
+            "symbol",
+            "name",
+            "price",
+            "change",
+            "percent",
+            "volume",
+            "time",
+        )
+        tree = ttk.Treeview(
+            table_frame,
+            columns=columns,
+            show="headings",
+            height=8,
+        )
+        scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=tree.yview)
+        xscrollbar = ttk.Scrollbar(table_frame, orient="horizontal", command=tree.xview)
+        tree.configure(
+            yscrollcommand=scrollbar.set,
+            xscrollcommand=xscrollbar.set,
+        )
+        headings = {
+            "symbol": "代號",
+            "name": "名稱",
+            "price": "現價(USD)",
+            "change": "漲跌",
+            "percent": "%",
+            "volume": "成交量",
+            "time": "台北時間",
+        }
+        widths = {
+            "symbol": 70,
+            "name": 155,
+            "price": 90,
+            "change": 82,
+            "percent": 70,
+            "volume": 100,
+            "time": 98,
+        }
+        for column in columns:
+            tree.heading(column, text=headings[column])
+            tree.column(column, width=widths[column], anchor="e")
+        tree.column("symbol", anchor="w")
+        tree.column("name", anchor="w")
+        tree.tag_configure("up", foreground=self.theme["up"])
+        tree.tag_configure("down", foreground=self.theme["down"])
+        tree.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        xscrollbar.grid(row=1, column=0, sticky="ew")
+        table_frame.rowconfigure(0, weight=1)
+        table_frame.columnconfigure(0, weight=1)
+        return tree
+
     def on_root_resize(self, event: tk.Event) -> None:
-        if event.widget is self.root and not self.applying_theme:
+        if event.widget is self.root:
             self.layout_for_width(event.width)
 
     def layout_for_width(self, width: int, force: bool = False) -> None:
@@ -1102,6 +2084,28 @@ class StockDynamicApp:
         for row in range((len(self.card_widgets) + card_columns - 1) // card_columns):
             self.card_frame.rowconfigure(row, weight=1)
 
+        for column in range(4):
+            self.us_card_frame.columnconfigure(column, weight=0)
+        for row in range(4):
+            self.us_card_frame.rowconfigure(row, weight=0)
+        for index, frame in enumerate(self.us_card_widgets):
+            frame.grid_forget()
+            row = index // card_columns
+            column = index % card_columns
+            frame.grid(
+                row=row,
+                column=column,
+                sticky="nsew",
+                padx=(0 if column == 0 else 10, 0),
+                pady=(0 if row == 0 else 10, 0),
+            )
+        for column in range(card_columns):
+            self.us_card_frame.columnconfigure(column, weight=1, uniform="us_cards")
+        for row in range(
+            (len(self.us_card_widgets) + card_columns - 1) // card_columns
+        ):
+            self.us_card_frame.rowconfigure(row, weight=1)
+
         for index in range(2):
             self.body.columnconfigure(index, weight=0)
             self.body.rowconfigure(index, weight=0)
@@ -1114,20 +2118,22 @@ class StockDynamicApp:
             self.body.columnconfigure(0, weight=1)
             self.body.rowconfigure(0, weight=3)
             self.main_pane.configure(orient="vertical")
+            self.us_main_pane.configure(orient="vertical")
             self.main_pane.grid(row=0, column=0, sticky="nsew")
         else:
             self.body.columnconfigure(0, weight=3)
             self.body.columnconfigure(1, weight=2)
             self.body.rowconfigure(0, weight=1)
             self.main_pane.configure(orient="horizontal")
+            self.us_main_pane.configure(orient="horizontal")
             self.main_pane.grid(row=0, column=0, columnspan=2, sticky="nsew")
 
         self.draw_chart()
+        self.draw_us_charts()
 
     def apply_theme(self) -> None:
         theme = self.theme
         self.root.configure(bg=theme["bg"])
-        self.theme_button_text.set(theme["next_label"])
 
         self.style.configure("TFrame", background=theme["bg"])
         self.style.configure("Header.TFrame", background=theme["surface"])
@@ -1159,27 +2165,69 @@ class StockDynamicApp:
             foreground=[("selected", theme["text"])],
         )
 
-        for pane in [self.main_pane, self.chart_pane, *self.chart_rows]:
+        for pane in [
+            self.main_pane,
+            self.chart_pane,
+            *self.chart_rows,
+            self.taiwan_tables_pane,
+            self.us_main_pane,
+            self.us_tables_pane,
+        ]:
             pane.configure(bg=theme["line"])
-        for canvas in self.index_canvases.values():
+        for canvas in [
+            *self.index_canvases.values(),
+            *self.us_chart_canvases.values(),
+        ]:
             canvas.configure(bg=theme["surface"])
         self.etf_tree.tag_configure("up", foreground=theme["up"])
         self.etf_tree.tag_configure("down", foreground=theme["down"])
+        for tree in (self.tw_stock_tree, self.adr_tree, self.us_stock_tree):
+            tree.tag_configure("up", foreground=theme["up"])
+            tree.tag_configure("down", foreground=theme["down"])
         for name, labels in self.cards.items():
             labels["accent"].configure(bg=CHART_COLORS.get(name, theme["accent"]))
+        for name, labels in self.us_cards.items():
+            labels["accent"].configure(
+                bg=CHART_COLORS.get(name, theme["accent"])
+            )
         self.draw_chart()
+        self.draw_us_charts()
 
-    def toggle_theme(self) -> None:
-        self.theme_name = "night" if self.theme_name == "day" else "day"
-        self.theme = THEMES[self.theme_name]
-        self.applying_theme = True
-        try:
-            self.apply_theme()
-            if self.market_window and not self.market_window.closed:
-                self.market_window.apply_theme()
-        finally:
-            self.applying_theme = False
-        self.root.after_idle(lambda: self.layout_for_width(self.root.winfo_width(), force=True))
+    def switch_market_page(self) -> None:
+        self.active_page = "us" if self.active_page == "taiwan" else "taiwan"
+        if self.active_page == "us":
+            self.us_page.tkraise()
+            self.market_page_button_text.set("返回台股")
+            self.subtitle_text.set("美股四大指數、ADR 與美國個股")
+        else:
+            self.taiwan_page.tkraise()
+            self.market_page_button_text.set("切換美股")
+            self.subtitle_text.set("台股四大指數、ETF 與個股即時看板")
+        self.current_layout = None
+        self.layout_for_width(self.root.winfo_width() or 1240, force=True)
+        self.schedule_refresh(0)
+
+    def add_taiwan_stock_symbol(self) -> None:
+        code = self.tw_stock_text.get().strip().upper()
+        if not re.fullmatch(r"[0-9A-Z]{4,6}", code):
+            self.status_text.set("台股代號格式錯誤，請輸入例如 2330、6488")
+            return
+        if code not in self.tw_stock_symbols:
+            self.tw_stock_symbols[code] = code
+        self.tw_stock_text.set("")
+        self.status_text.set(f"已加入 {code}，正在更新台股個股行情...")
+        self.schedule_refresh(0)
+
+    def add_us_stock_symbol(self) -> None:
+        symbol = self.us_symbol_text.get().strip().upper()
+        if not re.fullmatch(r"[A-Z0-9.^=-]{1,15}", symbol):
+            self.status_text.set("美股代號格式錯誤，請輸入例如 PLTR、BRK-B")
+            return
+        if symbol not in self.us_stock_symbols:
+            self.us_stock_symbols[symbol] = symbol
+        self.us_symbol_text.set("")
+        self.status_text.set(f"已加入 {symbol}，正在更新行情...")
+        self.schedule_refresh(0)
 
     def open_market_overview(self) -> None:
         if self.market_window and not self.market_window.closed:
@@ -1195,16 +2243,66 @@ class StockDynamicApp:
             theme_getter=lambda: self.theme,
         )
 
+    def open_taiwan_futures(self) -> None:
+        if self.futures_window and not self.futures_window.closed:
+            self.futures_window.window.deiconify()
+            self.futures_window.window.lift()
+            self.futures_window.window.focus_force()
+            self.futures_window.refresh()
+            return
+        self.futures_window = TaiwanFuturesWindow(
+            parent=self.root,
+            timeout=self.timeout,
+            retries=self.retries,
+            refresh_interval=self.interval,
+            history_limit=self.history_limit,
+            theme_getter=lambda: self.theme,
+        )
+
     def close(self) -> None:
         self.closed = True
+        if self.refresh_job:
+            try:
+                self.root.after_cancel(self.refresh_job)
+            except tk.TclError:
+                pass
         self.root.destroy()
+
+    def schedule_refresh(self, delay_ms: int | None = None) -> None:
+        if self.closed:
+            return
+        if self.refresh_job:
+            try:
+                self.root.after_cancel(self.refresh_job)
+            except tk.TclError:
+                pass
+        delay = self.interval * 1000 if delay_ms is None else max(0, delay_ms)
+        self.refresh_job = self.root.after(delay, self.run_scheduled_refresh)
+
+    def run_scheduled_refresh(self) -> None:
+        self.refresh_job = None
+        self.refresh()
+
+    def refresh_all(self) -> None:
+        """Refresh the active dashboard and an open futures window together."""
+        self.refresh()
+        if self.futures_window and not self.futures_window.closed:
+            self.futures_window.refresh()
 
     def refresh(self) -> None:
         if self.loading or self.closed:
             return
+        if self.refresh_job:
+            try:
+                self.root.after_cancel(self.refresh_job)
+            except tk.TclError:
+                pass
+            self.refresh_job = None
         self.loading = True
+        self.loading_page = self.active_page
         self.status_text.set("正在更新行情...")
-        worker = threading.Thread(target=self.fetch_worker, daemon=True)
+        target = self.fetch_us_worker if self.active_page == "us" else self.fetch_worker
+        worker = threading.Thread(target=target, daemon=True)
         worker.start()
 
     def fetch_worker(self) -> None:
@@ -1216,11 +2314,25 @@ class StockDynamicApp:
                 self.source,
                 False,
             )
-            all_etfs = (
-                fetch_all_etf_quotes(self.timeout, self.retries, self.verify_ssl)
-                if self.include_etfs
-                else None
-            )
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                stock_future = executor.submit(
+                    fetch_taiwan_security_quotes,
+                    dict(self.tw_stock_symbols),
+                    self.timeout,
+                    self.retries,
+                )
+                etf_future = (
+                    executor.submit(
+                        fetch_all_etf_quotes,
+                        self.timeout,
+                        self.retries,
+                        self.verify_ssl,
+                    )
+                    if self.include_etfs
+                    else None
+                )
+                taiwan_stocks = stock_future.result()
+                all_etfs = etf_future.result() if etf_future else None
             desired_mode = chart_mode_for_market_time(api_time)
             histories: dict[str, list[MarketCandle]] = {}
             grains: dict[str, str] = {}
@@ -1254,9 +2366,90 @@ class StockDynamicApp:
                         api_time,
                         data_source,
                         all_etfs,
+                        taiwan_stocks,
                         histories,
                         grains,
                         desired_mode,
+                    ),
+                )
+            )
+        except Exception as exc:
+            self.result_queue.put(("error", exc))
+
+    def fetch_us_worker(self) -> None:
+        try:
+            index_symbols = {
+                symbol: name for name, symbol in US_INDEX_SYMBOLS.items()
+            }
+            requested_symbols = {
+                **self.us_stock_symbols,
+                **TAIWAN_ADR_SYMBOLS,
+                **index_symbols,
+            }
+            all_quotes = fetch_yahoo_security_quotes(
+                requested_symbols,
+                self.timeout,
+                self.retries,
+            )
+            quote_by_symbol = {quote.symbol: quote for quote in all_quotes}
+            index_quotes = [
+                quote_by_symbol[symbol] for symbol in index_symbols
+            ]
+            adr_quotes = [
+                quote_by_symbol[symbol] for symbol in TAIWAN_ADR_SYMBOLS
+            ]
+            stock_quotes = [
+                quote_by_symbol[symbol] for symbol in self.us_stock_symbols
+            ]
+
+            desired_mode = chart_mode_for_us_quotes(index_quotes)
+            histories: dict[str, list[MarketCandle]] = {}
+            grains: dict[str, str] = {}
+            reload_history = (
+                desired_mode != self.us_chart_mode
+                or not self.us_history_loaded_at
+                or time.monotonic() - self.us_history_loaded_at >= 300
+            )
+            if reload_history:
+                with ThreadPoolExecutor(max_workers=len(US_CHART_NAMES)) as executor:
+                    futures = {}
+                    for name, symbol in US_INDEX_SYMBOLS.items():
+                        future = executor.submit(
+                            fetch_yahoo_candles,
+                            symbol,
+                            self.timeout,
+                            self.retries,
+                            self.history_limit,
+                            desired_mode == "intraday",
+                        )
+                        futures[future] = (name, "美股")
+                    for future in as_completed(futures):
+                        name, market_type = futures[future]
+                        try:
+                            candles, grain = future.result()
+                        except (OSError, RuntimeError, ValueError):
+                            histories[name] = []
+                            grains[name] = (
+                                "5 分 K（暫無資料）"
+                                if market_type == "美股"
+                                and desired_mode == "intraday"
+                                else "日 K（暫無資料）"
+                            )
+                        else:
+                            histories[name] = candles
+                            grains[name] = grain
+
+            self.result_queue.put(
+                (
+                    "us_data",
+                    (
+                        index_quotes,
+                        adr_quotes,
+                        stock_quotes,
+                        histories,
+                        grains,
+                        desired_mode,
+                        reload_history,
                     ),
                 )
             )
@@ -1267,13 +2460,16 @@ class StockDynamicApp:
         try:
             while True:
                 kind, payload = self.result_queue.get_nowait()
+                completed_page = self.loading_page
                 self.loading = False
+                self.loading_page = ""
                 if kind == "data":
                     (
                         quotes,
                         api_time,
                         data_source,
                         etfs,
+                        taiwan_stocks,
                         histories,
                         grains,
                         desired_mode,
@@ -1283,12 +2479,17 @@ class StockDynamicApp:
                         api_time,
                         data_source,
                         etfs,
+                        taiwan_stocks,
                         histories,
                         grains,
                         desired_mode,
                     )
+                elif kind == "us_data":
+                    self.update_us_market(*payload)
                 else:
                     self.status_text.set(f"更新失敗：{payload}")
+                delay = 0 if completed_page != self.active_page else self.interval * 1000
+                self.schedule_refresh(delay)
         except queue.Empty:
             pass
 
@@ -1301,6 +2502,7 @@ class StockDynamicApp:
         api_time: str,
         data_source: str,
         etfs: list[EtfMarketRow] | None,
+        taiwan_stocks: dict[str, SecurityQuote],
         histories: dict[str, list[MarketCandle]] | None = None,
         grains: dict[str, str] | None = None,
         desired_mode: str | None = None,
@@ -1334,8 +2536,156 @@ class StockDynamicApp:
             labels["time"].configure(text=f"時間 {quote.market_time}")
 
         self.update_etfs(etfs)
+        self.update_taiwan_stocks(taiwan_stocks)
         self.draw_chart()
-        self.root.after(self.interval * 1000, self.refresh)
+
+    def update_us_market(
+        self,
+        index_quotes: list[SecurityQuote],
+        adr_quotes: list[SecurityQuote],
+        stock_quotes: list[SecurityQuote],
+        histories: dict[str, list[MarketCandle]],
+        grains: dict[str, str],
+        desired_mode: str,
+        history_reloaded: bool,
+    ) -> None:
+        if history_reloaded:
+            for name in US_CHART_NAMES:
+                self.us_candles[name] = histories.get(name, [])[-self.history_limit:]
+            self.us_candle_grains.update(grains)
+            self.us_history_loaded_at = time.monotonic()
+        self.us_chart_mode = desired_mode
+
+        for quote in index_quotes:
+            self.us_previous_close[quote.name] = quote.previous_close
+            if quote.price is not None:
+                self.update_us_live_candle(quote.name, quote)
+            labels = self.us_cards.get(quote.name)
+            if not labels:
+                continue
+            labels["value"].configure(text=fmt_number(quote.price))
+            labels["change"].configure(
+                text=(
+                    f"{fmt_signed(quote.change)} / "
+                    f"{fmt_signed(quote.change_percent)}%"
+                ),
+                style=(
+                    "Up.TLabel"
+                    if (quote.change or 0) >= 0
+                    else "Down.TLabel"
+                ),
+            )
+            labels["time"].configure(text=f"時間 {quote.market_time}")
+
+        self.update_security_tree(self.adr_tree, adr_quotes)
+        self.update_security_tree(self.us_stock_tree, stock_quotes)
+        available_times = [
+            quote.market_time
+            for quote in index_quotes
+            if quote.market_time != "--"
+        ]
+        market_time = max(available_times) if available_times else "--"
+        mode_text = "盤中 5 分 K" if desired_mode == "intraday" else "日 K"
+        self.status_text.set(
+            f"美股行情時間：{market_time}｜K 線模式：{mode_text}"
+        )
+        self.source_text.set(
+            f"來源：Yahoo Finance｜更新頻率：{self.interval} 秒"
+        )
+        self.draw_us_charts()
+
+    def update_security_tree(
+        self,
+        tree: ttk.Treeview,
+        quotes: list[SecurityQuote],
+    ) -> None:
+        for item in tree.get_children():
+            tree.delete(item)
+        for quote in quotes:
+            tag = ""
+            if quote.change is not None:
+                tag = "up" if quote.change >= 0 else "down"
+            tree.insert(
+                "",
+                "end",
+                iid=quote.symbol,
+                values=(
+                    quote.symbol,
+                    quote.name,
+                    fmt_number(quote.price),
+                    fmt_signed(quote.change),
+                    f"{fmt_signed(quote.change_percent)}%",
+                    fmt_number(quote.volume, 0),
+                    quote.market_time,
+                ),
+                tags=(tag,) if tag else (),
+            )
+
+    def update_us_live_candle(
+        self,
+        name: str,
+        quote: SecurityQuote,
+    ) -> None:
+        if quote.price is None:
+            return
+        candles = self.us_candles[name]
+        grain = self.us_candle_grains.get(name, "即時 K")
+        moment = (
+            datetime.fromtimestamp(quote.market_timestamp)
+            if quote.market_timestamp
+            else datetime.now()
+        )
+        if grain.startswith("日 K"):
+            label = moment.strftime("%Y-%m-%d")
+            open_value = quote.open_price or (
+                candles[-1].close if candles else quote.price
+            )
+            live = MarketCandle(
+                int(moment.timestamp()),
+                label,
+                open_value,
+                max(quote.high or quote.price, open_value, quote.price),
+                min(quote.low or quote.price, open_value, quote.price),
+                quote.price,
+            )
+            if candles and candles[-1].label == label:
+                candles[-1] = live
+            else:
+                candles.append(live)
+        else:
+            interval_match = re.search(r"(\d+)\s*分", grain)
+            interval_minutes = int(interval_match.group(1)) if interval_match else 5
+            minute = moment.minute - moment.minute % interval_minutes
+            bucket = moment.replace(minute=minute, second=0, microsecond=0)
+            label = bucket.strftime("%m/%d %H:%M")
+            if candles and candles[-1].label == label:
+                current = candles[-1]
+                candles[-1] = MarketCandle(
+                    current.timestamp,
+                    current.label,
+                    current.open,
+                    max(current.high, quote.price),
+                    min(current.low, quote.price),
+                    quote.price,
+                )
+            else:
+                open_value = (
+                    candles[-1].close
+                    if candles
+                    else quote.open_price or quote.price
+                )
+                candles.append(
+                    MarketCandle(
+                        int(bucket.timestamp()),
+                        label,
+                        open_value,
+                        max(open_value, quote.price),
+                        min(open_value, quote.price),
+                        quote.price,
+                    )
+                )
+            self.us_candle_grains.setdefault(name, f"{interval_minutes} 分 K")
+        del candles[:-self.history_limit]
 
     def update_live_candle(self, quote: IndexQuote, market_date: str) -> None:
         if quote.price is None:
@@ -1393,6 +2743,62 @@ class StockDynamicApp:
                 )
             self.candle_grains.setdefault(quote.name, f"{interval_minutes} 分 K")
         del candles[:-self.history_limit]
+
+    def update_taiwan_stocks(
+        self,
+        stocks: dict[str, SecurityQuote],
+    ) -> None:
+        for item in self.tw_stock_tree.get_children():
+            self.tw_stock_tree.delete(item)
+        self.tw_stock_rows = dict(stocks)
+        for code in self.tw_stock_symbols:
+            quote = stocks.get(code)
+            if not quote:
+                continue
+            if self.tw_stock_symbols[code] == code and quote.name != code:
+                self.tw_stock_symbols[code] = quote.name
+            tag = ""
+            if quote.change is not None:
+                tag = "up" if quote.change >= 0 else "down"
+            source = (
+                quote.source
+                if quote.price is not None
+                else "Yahoo Finance（暫無資料）"
+            )
+            self.tw_stock_tree.insert(
+                "",
+                "end",
+                iid=code,
+                values=(
+                    code,
+                    quote.name,
+                    fmt_number(quote.price),
+                    fmt_signed(quote.change),
+                    f"{fmt_signed(quote.change_percent)}%",
+                    fmt_number(quote.volume, 0),
+                    quote.market_time,
+                    source,
+                ),
+                tags=(tag,) if tag else (),
+            )
+
+    def open_selected_taiwan_stock(self, _event: tk.Event) -> None:
+        selection = self.tw_stock_tree.selection()
+        if not selection:
+            return
+        code = selection[0]
+        quote = self.tw_stock_rows.get(code)
+        if not quote:
+            return
+        TaiwanStockDetailWindow(
+            parent=self.root,
+            code=code,
+            initial=quote,
+            interval=self.interval,
+            timeout=self.timeout,
+            retries=self.retries,
+            theme_getter=lambda: self.theme,
+        )
 
     def update_etfs(self, etfs: list[EtfMarketRow] | None) -> None:
         for item in self.etf_tree.get_children():
@@ -1537,6 +2943,401 @@ class StockDynamicApp:
             canvas,
             theme,
             candles,
+            previous_close,
+            plot_left,
+            plot_top,
+            plot_right,
+            plot_bottom,
+        )
+
+    def draw_us_charts(self) -> None:
+        for name in US_CHART_NAMES:
+            self.draw_one_us_chart(name)
+
+    def draw_one_us_chart(self, name: str) -> None:
+        canvas = self.us_chart_canvases.get(name)
+        if not canvas:
+            return
+        canvas.delete("all")
+        width = max(canvas.winfo_width(), 280)
+        height = max(canvas.winfo_height(), 125)
+        theme = self.theme
+        x0, y0, x1, y1 = 4, 4, width - 4, height - 4
+        all_candles = self.us_candles.get(name, [])
+        previous_close = self.us_previous_close.get(name)
+        latest_value = all_candles[-1].close if all_candles else None
+        color = trend_color(theme, latest_value, previous_close)
+
+        canvas.create_rectangle(
+            x0,
+            y0,
+            x1,
+            y1,
+            fill=theme["surface_alt"],
+            outline=theme["line"],
+        )
+        canvas.create_text(
+            x0 + 10,
+            y0 + 16,
+            text=name,
+            fill=theme["text"],
+            anchor="w",
+            font=("Microsoft JhengHei UI", 9, "bold"),
+        )
+        canvas.create_text(
+            x0 + 10,
+            y0 + 33,
+            text=(
+                f"{pct_text(latest_value, previous_close)}  "
+                f"{self.us_candle_grains.get(name, 'K 線')}"
+            ),
+            fill=color,
+            anchor="w",
+            font=("Segoe UI", 8, "bold"),
+        )
+        canvas.create_text(
+            x1 - 10,
+            y0 + 16,
+            text=fmt_number(latest_value),
+            fill=color,
+            anchor="e",
+            font=("Segoe UI", 11, "bold"),
+        )
+        for x, period in (
+            (x1 - 92, 5),
+            (x1 - 52, 10),
+            (x1 - 10, 20),
+        ):
+            canvas.create_text(
+                x,
+                y0 + 33,
+                text=f"MA{period}",
+                fill=theme[f"ma{period}"],
+                anchor="e",
+                font=("Segoe UI", 7, "bold"),
+            )
+
+        plot_left = x0 + 8
+        plot_right = x1 - 68
+        plot_top = y0 + 48
+        plot_bottom = y1 - 24
+        plot_width = max(1, plot_right - plot_left)
+        max_visible = max(12, min(self.history_limit, int(plot_width / 7)))
+        draw_candlestick_plot(
+            canvas,
+            theme,
+            all_candles[-max_visible:],
+            previous_close,
+            plot_left,
+            plot_top,
+            plot_right,
+            plot_bottom,
+        )
+
+
+class TaiwanFuturesWindow:
+    """Yahoo-powered live view for four Taiwan near-month index futures."""
+
+    def __init__(
+        self,
+        parent: tk.Tk,
+        timeout: int,
+        retries: int,
+        refresh_interval: int,
+        history_limit: int,
+        theme_getter,
+    ) -> None:
+        self.timeout = timeout
+        self.retries = retries
+        self.refresh_interval = refresh_interval
+        self.history_limit = history_limit
+        self.theme_getter = theme_getter
+        self.candles: dict[str, list[MarketCandle]] = defaultdict(list)
+        self.grains: dict[str, str] = {}
+        self.previous_close: dict[str, float | None] = {}
+        self.queue: queue.Queue[tuple[str, object]] = queue.Queue()
+        self.loading = False
+        self.closed = False
+        self.refresh_job: str | None = None
+
+        self.window = tk.Toplevel(parent)
+        self.window.title("台指近月期貨｜四大指數")
+        self.window.geometry("1040x720")
+        self.window.minsize(760, 560)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.status_text = tk.StringVar(value="正在載入 Yahoo 台灣期貨行情...")
+        self.build_ui()
+        self.apply_theme()
+        self.refresh()
+        self.window.after(200, self.process_results)
+
+    def build_ui(self) -> None:
+        self.frame = ttk.Frame(self.window, style="TFrame", padding=16)
+        self.frame.pack(fill="both", expand=True)
+
+        header = ttk.Frame(self.frame, style="Header.TFrame", padding=(18, 14))
+        header.pack(fill="x", pady=(0, 10))
+        ttk.Label(
+            header,
+            text="台指近月期貨｜四大指數",
+            style="Header.TLabel",
+            font=("Microsoft JhengHei UI", 20, "bold"),
+        ).grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            header,
+            text=(
+                "台指、小型台指、電子、金融近月 5 分 K｜"
+                f"四圖同步更新：每 {self.refresh_interval} 秒｜來源：Yahoo 股市"
+            ),
+            style="Muted.TLabel",
+            font=("Microsoft JhengHei UI", 9),
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(
+            header,
+            textvariable=self.status_text,
+            style="Muted.TLabel",
+            font=("Microsoft JhengHei UI", 9),
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Button(
+            header,
+            text="同步更新四圖",
+            style="Flat.TButton",
+            command=self.refresh,
+        ).grid(row=0, column=1, rowspan=3, sticky="e")
+        header.columnconfigure(0, weight=1)
+
+        self.chart_panel = ttk.Frame(
+            self.frame,
+            style="Card.TFrame",
+            padding=12,
+        )
+        self.chart_panel.pack(fill="both", expand=True)
+        self.canvases: dict[str, tk.Canvas] = {}
+        for index, name in enumerate(TAIWAN_FUTURE_CHART_NAMES):
+            row, column = divmod(index, 2)
+            canvas = tk.Canvas(
+                self.chart_panel,
+                highlightthickness=0,
+                height=240,
+                width=440,
+            )
+            canvas.grid(
+                row=row,
+                column=column,
+                sticky="nsew",
+                padx=(0 if column == 0 else 5, 5 if column == 0 else 0),
+                pady=(0 if row == 0 else 5, 5 if row == 0 else 0),
+            )
+            canvas.bind(
+                "<Configure>",
+                lambda _event, chart_name=name: self.draw_one_chart(chart_name),
+            )
+            self.canvases[name] = canvas
+        for index in range(2):
+            self.chart_panel.columnconfigure(index, weight=1, uniform="futures")
+            self.chart_panel.rowconfigure(index, weight=1, uniform="futures")
+
+    def apply_theme(self) -> None:
+        theme = self.theme_getter()
+        self.window.configure(bg=theme["bg"])
+        for canvas in self.canvases.values():
+            canvas.configure(bg=theme["surface"])
+        self.draw_charts()
+
+    def close(self) -> None:
+        self.closed = True
+        if self.refresh_job:
+            try:
+                self.window.after_cancel(self.refresh_job)
+            except tk.TclError:
+                pass
+        self.window.destroy()
+
+    def schedule_refresh(self) -> None:
+        if self.closed:
+            return
+        if self.refresh_job:
+            try:
+                self.window.after_cancel(self.refresh_job)
+            except tk.TclError:
+                pass
+        self.refresh_job = self.window.after(
+            self.refresh_interval * 1000,
+            self.refresh,
+        )
+
+    def refresh(self) -> None:
+        if self.closed or self.loading:
+            return
+        if self.refresh_job:
+            try:
+                self.window.after_cancel(self.refresh_job)
+            except tk.TclError:
+                pass
+            self.refresh_job = None
+        self.loading = True
+        self.status_text.set("正在同步更新四張 Yahoo 台灣期貨 5 分 K...")
+        threading.Thread(target=self.fetch_worker, daemon=True).start()
+
+    def fetch_worker(self) -> None:
+        try:
+            payload = fetch_yahoo_tw_futures(
+                YAHOO_TW_FUTURE_SYMBOLS,
+                self.timeout,
+                self.retries,
+                self.history_limit,
+            )
+            self.queue.put(("data", payload))
+        except Exception as exc:
+            self.queue.put(("error", exc))
+
+    def process_results(self) -> None:
+        try:
+            while True:
+                kind, payload = self.queue.get_nowait()
+                self.loading = False
+                if kind == "data":
+                    self.update_data(*payload)
+                else:
+                    self.status_text.set(f"更新失敗：{payload}")
+                    self.schedule_refresh()
+        except queue.Empty:
+            pass
+        if not self.closed:
+            self.window.after(200, self.process_results)
+
+    def update_data(
+        self,
+        histories: dict[str, list[MarketCandle]],
+        grains: dict[str, str],
+        previous_closes: dict[str, float | None],
+        refreshed_times: list[str],
+        errors: list[str],
+    ) -> None:
+        for name in TAIWAN_FUTURE_CHART_NAMES:
+            candles = histories.get(name, [])
+            if candles:
+                self.candles[name] = candles[-self.history_limit:]
+            self.grains[name] = grains.get(name, "Yahoo 5 分 K")
+            previous_close = previous_closes.get(name)
+            if previous_close is not None:
+                self.previous_close[name] = previous_close
+            if candles:
+                self.previous_close.setdefault(
+                    name,
+                    candles[-2].close if len(candles) >= 2 else candles[-1].open,
+                )
+        available_times = [
+            candles[-1].label
+            for candles in self.candles.values()
+            if candles
+        ]
+        latest_candle = max(available_times) if available_times else "--"
+        yahoo_time = "--"
+        if refreshed_times:
+            latest_refresh = max(refreshed_times)
+            try:
+                yahoo_time = datetime.fromisoformat(
+                    latest_refresh.replace("Z", "+00:00")
+                ).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                yahoo_time = latest_refresh
+        suffix = f"｜{len(errors)} 項暫無資料" if errors else ""
+        self.status_text.set(
+            f"Yahoo 行情時間：{yahoo_time}｜最新 K 線：{latest_candle}｜"
+            f"本機更新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            f"｜下次自動更新：約 {self.refresh_interval} 秒後{suffix}"
+        )
+        self.draw_charts()
+        self.schedule_refresh()
+
+    def draw_charts(self) -> None:
+        for name in TAIWAN_FUTURE_CHART_NAMES:
+            self.draw_one_chart(name)
+
+    def draw_one_chart(self, name: str) -> None:
+        canvas = self.canvases.get(name)
+        if not canvas:
+            return
+        canvas.delete("all")
+        theme = self.theme_getter()
+        width = max(canvas.winfo_width(), 320)
+        height = max(canvas.winfo_height(), 220)
+        x0, y0, x1, y1 = 4, 4, width - 4, height - 4
+        all_candles = self.candles.get(name, [])
+        previous_close = self.previous_close.get(name)
+        latest_value = all_candles[-1].close if all_candles else None
+        color = trend_color(theme, latest_value, previous_close)
+
+        canvas.create_rectangle(
+            x0,
+            y0,
+            x1,
+            y1,
+            fill=theme["surface_alt"],
+            outline=theme["line"],
+        )
+        canvas.create_text(
+            x0 + 12,
+            y0 + 18,
+            text=name,
+            fill=theme["text"],
+            anchor="w",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+        )
+        canvas.create_text(
+            x0 + 12,
+            y0 + 38,
+            text=(
+                f"{pct_text(latest_value, previous_close)}  "
+                f"{self.grains.get(name, '日 K')}"
+            ),
+            fill=color,
+            anchor="w",
+            font=("Segoe UI", 9, "bold"),
+        )
+        canvas.create_text(
+            x1 - 12,
+            y0 + 18,
+            text=fmt_number(latest_value),
+            fill=color,
+            anchor="e",
+            font=("Segoe UI", 12, "bold"),
+        )
+        for x, period in (
+            (x1 - 102, 5),
+            (x1 - 58, 10),
+            (x1 - 12, 20),
+        ):
+            canvas.create_text(
+                x,
+                y0 + 38,
+                text=f"MA{period}",
+                fill=theme[f"ma{period}"],
+                anchor="e",
+                font=("Segoe UI", 8, "bold"),
+            )
+
+        plot_left = x0 + 10
+        plot_right = x1 - 72
+        plot_top = y0 + 54
+        plot_bottom = y1 - 28
+        if not all_candles:
+            canvas.create_text(
+                (plot_left + plot_right) / 2,
+                (plot_top + plot_bottom) / 2,
+                text=self.grains.get(name, "正在載入 Yahoo 期貨行情…"),
+                fill=theme["muted"],
+                font=("Microsoft JhengHei UI", 10),
+            )
+            return
+        plot_width = max(1, plot_right - plot_left)
+        max_visible = max(12, min(self.history_limit, int(plot_width / 7)))
+        draw_candlestick_plot(
+            canvas,
+            theme,
+            all_candles[-max_visible:],
             previous_close,
             plot_left,
             plot_top,
@@ -2160,6 +3961,91 @@ class EtfDetailWindow:
             top,
             plot_right,
             bottom,
+        )
+
+
+class TaiwanStockDetailWindow(EtfDetailWindow):
+    def __init__(
+        self,
+        parent: tk.Tk,
+        code: str,
+        initial: SecurityQuote,
+        interval: int,
+        timeout: int,
+        retries: int,
+        theme_getter,
+    ) -> None:
+        self.security_symbol = initial.symbol
+        super().__init__(
+            parent=parent,
+            initial=security_quote_to_market_row(code, initial),
+            interval=interval,
+            timeout=timeout,
+            retries=retries,
+            verify_ssl=False,
+            theme_getter=theme_getter,
+        )
+
+    def fetch_worker(self) -> None:
+        try:
+            quote = fetch_taiwan_security_quote(
+                self.code,
+                "",
+                self.timeout,
+                self.retries,
+            )
+            self.security_symbol = quote.symbol
+            desired_mode = chart_mode_for_time()
+            candles: list[MarketCandle] | None = None
+            grain: str | None = None
+            if desired_mode != self.chart_mode:
+                try:
+                    candles, grain = fetch_yahoo_candles(
+                        self.security_symbol,
+                        self.timeout,
+                        self.retries,
+                        self.history_limit,
+                        prefer_intraday=desired_mode == "intraday",
+                    )
+                except RuntimeError:
+                    candles = []
+                    grain = (
+                        "5 分 K（即時建立）"
+                        if desired_mode == "intraday"
+                        else "日 K（即時建立）"
+                    )
+            self.queue.put(
+                (
+                    "data",
+                    (
+                        security_quote_to_market_row(self.code, quote),
+                        candles,
+                        grain,
+                        desired_mode,
+                    ),
+                )
+            )
+        except Exception as exc:
+            self.queue.put(("error", exc))
+
+    def update_quote(
+        self,
+        quote: EtfMarketRow,
+        candles: list[MarketCandle] | None = None,
+        grain: str | None = None,
+        desired_mode: str | None = None,
+    ) -> None:
+        super().update_quote(quote, candles, grain, desired_mode)
+        self.detail_text.set(
+            "｜".join(
+                [
+                    f"開盤 {fmt_number(quote.open_price)}",
+                    f"最高 {fmt_number(quote.high)}",
+                    f"最低 {fmt_number(quote.low)}",
+                    f"昨收 {fmt_number(quote.previous_close)}",
+                    f"成交量 {fmt_number(quote.volume, 0)}",
+                ]
+            )
         )
 
 
