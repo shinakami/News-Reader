@@ -17,12 +17,15 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, time as clock_time, timedelta, timezone
-from tkinter import ttk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 from typing import Sequence
 import urllib.request
 import urllib.parse
 import urllib.error
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+from PIL import Image, ImageColor, ImageOps, ImageTk
 
 from news_reader.stock_monitor import (
     INDICES,
@@ -149,6 +152,14 @@ THEMES = {
         "ma20": "#fb923c",
         "selected": "#334155",
     },
+}
+
+DASHBOARD_BACKGROUND_MODES = {
+    "填滿": "fill",
+    "符合": "fit",
+    "延伸": "stretch",
+    "並排": "tile",
+    "置中": "center",
 }
 
 
@@ -1500,6 +1511,19 @@ class StockDynamicApp:
         self.us_history_loaded_at = 0.0
         self.market_window: MarketOverviewWindow | None = None
         self.futures_window: TaiwanFuturesWindow | None = None
+        self.background_settings_window: tk.Toplevel | None = None
+        self.background_image: Image.Image | None = None
+        self.background_image_path = ""
+        self.background_transparency = tk.DoubleVar(value=65.0)
+        self.background_transparency_text = tk.StringVar(value="圖片透明度：65%")
+        self.background_file_text = tk.StringVar(value="尚未載入背景圖片")
+        self.background_mode_text = tk.StringVar(value="填滿")
+        self.background_photo_refs: dict[tk.Canvas, ImageTk.PhotoImage] = {}
+        self.background_frame_labels: dict[ttk.Frame, tk.Label] = {}
+        self.background_frame_photos: dict[ttk.Frame, ImageTk.PhotoImage] = {}
+        self.background_render_cache: dict[tuple[object, ...], Image.Image] = {}
+        self.background_bound_hosts: set[str] = set()
+        self.background_redraw_job: str | None = None
         self.result_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.loading = False
         self.loading_page = ""
@@ -1522,6 +1546,7 @@ class StockDynamicApp:
         self.card_widgets: list[ttk.Frame] = []
         self.current_layout: tuple[int, bool] | None = None
         self.build_ui()
+        self.register_global_background(self.root)
         self.apply_theme()
         self.root.bind("<Configure>", self.on_root_resize)
         self.refresh()
@@ -1581,6 +1606,12 @@ class StockDynamicApp:
             textvariable=self.market_page_button_text,
             style="Flat.TButton",
             command=self.switch_market_page,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            actions,
+            text="背景設定",
+            style="Flat.TButton",
+            command=self.open_background_settings,
         ).pack(side="left", padx=(0, 8))
         refresh_button = ttk.Button(
             actions,
@@ -2118,6 +2149,7 @@ class StockDynamicApp:
     def on_root_resize(self, event: tk.Event) -> None:
         if event.widget is self.root:
             self.layout_for_width(event.width)
+            self.schedule_background_redraw()
 
     def layout_for_width(self, width: int, force: bool = False) -> None:
         card_columns = 4
@@ -2194,6 +2226,337 @@ class StockDynamicApp:
 
         self.draw_chart()
         self.draw_us_charts()
+
+    def open_background_settings(self) -> None:
+        if self.background_settings_window and self.background_settings_window.winfo_exists():
+            self.background_settings_window.deiconify()
+            self.background_settings_window.lift()
+            self.background_settings_window.focus_force()
+            return
+
+        window = tk.Toplevel(self.root)
+        self.background_settings_window = window
+        window.title("Dashboard 背景設定")
+        window.geometry("520x315")
+        window.minsize(460, 295)
+        window.transient(self.root)
+        window.configure(bg=self.theme["bg"])
+        window.protocol("WM_DELETE_WINDOW", self.close_background_settings)
+
+        panel = ttk.Frame(window, style="Card.TFrame", padding=20)
+        panel.pack(fill="both", expand=True, padx=16, pady=16)
+        ttk.Label(
+            panel,
+            text="自訂 Dashboard 背景",
+            style="CardTitle.TLabel",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(
+            panel,
+            textvariable=self.background_file_text,
+            style="Muted.TLabel",
+            font=("Microsoft JhengHei UI", 9),
+        ).grid(row=1, column=0, columnspan=3, sticky="ew", pady=(8, 14))
+
+        ttk.Button(
+            panel,
+            text="載入圖片",
+            style="Flat.TButton",
+            command=self.load_background_image,
+        ).grid(row=2, column=0, sticky="w")
+        ttk.Button(
+            panel,
+            text="清除背景",
+            style="Flat.TButton",
+            command=self.clear_background_image,
+        ).grid(row=2, column=1, sticky="w", padx=(8, 0))
+
+        ttk.Label(
+            panel,
+            textvariable=self.background_transparency_text,
+            style="CardTitle.TLabel",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(18, 4))
+        transparency_scale = ttk.Scale(
+            panel,
+            from_=0,
+            to=100,
+            variable=self.background_transparency,
+            command=self.on_background_transparency_changed,
+        )
+        transparency_scale.grid(row=4, column=0, columnspan=3, sticky="ew")
+        ttk.Label(
+            panel,
+            text="0% 完全顯示圖片；100% 完全隱藏圖片",
+            style="Muted.TLabel",
+            font=("Microsoft JhengHei UI", 9),
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        ttk.Label(
+            panel,
+            text="圖片配置",
+            style="CardTitle.TLabel",
+            font=("Microsoft JhengHei UI", 10, "bold"),
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(16, 5))
+        mode_picker = ttk.Combobox(
+            panel,
+            state="readonly",
+            textvariable=self.background_mode_text,
+            values=list(DASHBOARD_BACKGROUND_MODES),
+            width=14,
+        )
+        mode_picker.grid(row=7, column=0, columnspan=2, sticky="w")
+        mode_picker.bind("<<ComboboxSelected>>", self.on_background_mode_changed)
+        panel.columnconfigure(2, weight=1)
+        self.register_global_background(window)
+        self.redraw_global_backgrounds()
+
+    def close_background_settings(self) -> None:
+        if self.background_settings_window:
+            self.background_settings_window.destroy()
+            self.background_settings_window = None
+
+    def load_background_image(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.background_settings_window or self.root,
+            title="選擇 Dashboard 背景圖片",
+            filetypes=[
+                ("圖片檔案", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"),
+                ("PNG", "*.png"),
+                ("JPEG", "*.jpg *.jpeg"),
+                ("所有檔案", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            with Image.open(path) as source_image:
+                self.background_image = ImageOps.exif_transpose(source_image).convert("RGB").copy()
+        except (OSError, ValueError) as exc:
+            messagebox.showerror(
+                "無法載入背景圖片",
+                f"圖片格式無法讀取：\n{exc}",
+                parent=self.background_settings_window or self.root,
+            )
+            return
+
+        self.background_image_path = path
+        self.background_file_text.set(f"已載入：{Path(path).name}")
+        self.status_text.set(f"Dashboard 背景已更新：{Path(path).name}")
+        self.background_render_cache.clear()
+        self.redraw_background_charts()
+
+    def clear_background_image(self) -> None:
+        self.background_image = None
+        self.background_image_path = ""
+        self.background_file_text.set("尚未載入背景圖片")
+        self.background_photo_refs.clear()
+        self.background_frame_photos.clear()
+        self.background_render_cache.clear()
+        self.status_text.set("Dashboard 背景圖片已清除")
+        self.redraw_background_charts()
+
+    def on_background_transparency_changed(self, value: str) -> None:
+        transparency = max(0, min(100, round(float(value))))
+        self.background_transparency_text.set(f"圖片透明度：{transparency}%")
+        self.background_render_cache.clear()
+        self.schedule_background_redraw()
+
+    def on_background_mode_changed(self, _event: tk.Event | None = None) -> None:
+        mode_label = self.background_mode_text.get()
+        if mode_label not in DASHBOARD_BACKGROUND_MODES:
+            self.background_mode_text.set("填滿")
+            mode_label = "填滿"
+        self.background_render_cache.clear()
+        self.status_text.set(f"Dashboard 背景配置：{mode_label}")
+        self.schedule_background_redraw()
+
+    def schedule_background_redraw(self, delay_ms: int = 70) -> None:
+        if self.background_redraw_job:
+            try:
+                self.root.after_cancel(self.background_redraw_job)
+            except tk.TclError:
+                pass
+        self.background_redraw_job = self.root.after(delay_ms, self.redraw_background_charts)
+
+    def redraw_background_charts(self) -> None:
+        self.background_redraw_job = None
+        self.redraw_global_backgrounds()
+        self.draw_chart()
+        self.draw_us_charts()
+        if self.futures_window and not self.futures_window.closed:
+            self.futures_window.draw_charts()
+
+    def register_global_background(self, container: tk.Misc) -> None:
+        """Place synchronized wallpaper slices behind every ttk frame."""
+        children = list(container.winfo_children())
+        for child in children:
+            if isinstance(child, ttk.Frame) and child not in self.background_frame_labels:
+                self.background_frame_labels[child] = tk.Label(
+                    child,
+                    bd=0,
+                    highlightthickness=0,
+                )
+            self.register_global_background(child)
+
+        host = container.winfo_toplevel()
+        host_key = str(host)
+        if host_key not in self.background_bound_hosts:
+            host.bind("<Configure>", self.on_background_host_resize, add="+")
+            self.background_bound_hosts.add(host_key)
+
+    def on_background_host_resize(self, event: tk.Event) -> None:
+        if event.widget is event.widget.winfo_toplevel():
+            self.background_render_cache.clear()
+            self.schedule_background_redraw(90)
+
+    def background_mode(self) -> str:
+        return DASHBOARD_BACKGROUND_MODES.get(self.background_mode_text.get(), "fill")
+
+    def build_host_background(
+        self,
+        host: tk.Misc,
+        theme: dict[str, str],
+    ) -> Image.Image | None:
+        if self.background_image is None:
+            return None
+        image_visibility = 1.0 - (float(self.background_transparency.get()) / 100.0)
+        if image_visibility <= 0:
+            return None
+
+        width = max(1, int(host.winfo_width()))
+        height = max(1, int(host.winfo_height()))
+        mode = self.background_mode()
+        cache_key = (
+            str(host),
+            width,
+            height,
+            mode,
+            round(image_visibility, 3),
+            id(self.background_image),
+            theme["bg"],
+        )
+        cached = self.background_render_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        base_color = ImageColor.getrgb(theme["bg"])
+        base = Image.new("RGB", (width, height), base_color)
+        layout = Image.new("RGB", (width, height), base_color)
+        source = self.background_image
+        if mode == "stretch":
+            layout = source.resize((width, height), Image.Resampling.LANCZOS)
+        elif mode == "fill":
+            layout = ImageOps.fit(
+                source,
+                (width, height),
+                method=Image.Resampling.LANCZOS,
+            )
+        elif mode == "fit":
+            fitted = ImageOps.contain(
+                source,
+                (width, height),
+                method=Image.Resampling.LANCZOS,
+            )
+            layout.paste(fitted, ((width - fitted.width) // 2, (height - fitted.height) // 2))
+        elif mode == "tile":
+            for x in range(0, width, source.width):
+                for y in range(0, height, source.height):
+                    layout.paste(source, (x, y))
+        else:  # center
+            layout.paste(source, ((width - source.width) // 2, (height - source.height) // 2))
+
+        rendered = Image.blend(base, layout, image_visibility)
+        self.background_render_cache = {
+            key: value
+            for key, value in self.background_render_cache.items()
+            if key[0] != str(host)
+        }
+        self.background_render_cache[cache_key] = rendered
+        return rendered
+
+    @staticmethod
+    def crop_widget_background(
+        host_background: Image.Image,
+        widget: tk.Misc,
+        host: tk.Misc,
+        width: int,
+        height: int,
+    ) -> Image.Image:
+        x = widget.winfo_rootx() - host.winfo_rootx()
+        y = widget.winfo_rooty() - host.winfo_rooty()
+        return host_background.crop((x, y, x + width, y + height))
+
+    def redraw_global_backgrounds(self) -> None:
+        if self.background_image is None or self.background_transparency.get() >= 100:
+            for label in self.background_frame_labels.values():
+                try:
+                    label.place_forget()
+                except tk.TclError:
+                    pass
+            self.background_frame_photos.clear()
+            return
+
+        invalid_frames: list[ttk.Frame] = []
+        for frame, label in list(self.background_frame_labels.items()):
+            try:
+                if not frame.winfo_exists():
+                    invalid_frames.append(frame)
+                    continue
+                host = frame.winfo_toplevel()
+                frame_width = max(1, frame.winfo_width())
+                frame_height = max(1, frame.winfo_height())
+                host_background = self.build_host_background(host, self.theme)
+                if host_background is None:
+                    label.place_forget()
+                    continue
+                crop = self.crop_widget_background(
+                    host_background,
+                    frame,
+                    host,
+                    frame_width,
+                    frame_height,
+                )
+                photo = ImageTk.PhotoImage(crop, master=label)
+                self.background_frame_photos[frame] = photo
+                label.configure(image=photo)
+                label.place(x=0, y=0, relwidth=1, relheight=1)
+                label.lower()
+            except tk.TclError:
+                invalid_frames.append(frame)
+        for frame in invalid_frames:
+            self.background_frame_labels.pop(frame, None)
+            self.background_frame_photos.pop(frame, None)
+
+    def draw_canvas_background(
+        self,
+        canvas: tk.Canvas,
+        width: int,
+        height: int,
+        theme: dict[str, str] | None = None,
+    ) -> bool:
+        if self.background_image is None:
+            self.background_photo_refs.pop(canvas, None)
+            return False
+
+        target_width = max(1, int(width))
+        target_height = max(1, int(height))
+        active_theme = theme or self.theme
+        host = canvas.winfo_toplevel()
+        host_background = self.build_host_background(host, active_theme)
+        if host_background is None:
+            self.background_photo_refs.pop(canvas, None)
+            return False
+        crop = self.crop_widget_background(
+            host_background,
+            canvas,
+            host,
+            target_width,
+            target_height,
+        )
+        photo = ImageTk.PhotoImage(crop, master=canvas)
+        self.background_photo_refs[canvas] = photo
+        canvas.create_image(0, 0, image=photo, anchor="nw", tags=("dashboard_background",))
+        return True
 
     def apply_theme(self) -> None:
         theme = self.theme
@@ -2306,6 +2669,8 @@ class StockDynamicApp:
             refresh_interval=max(60, self.interval),
             theme_getter=lambda: self.theme,
         )
+        self.register_global_background(self.market_window.window)
+        self.redraw_global_backgrounds()
 
     def open_taiwan_futures(self) -> None:
         if self.futures_window and not self.futures_window.closed:
@@ -2321,10 +2686,18 @@ class StockDynamicApp:
             refresh_interval=self.interval,
             history_limit=self.history_limit,
             theme_getter=lambda: self.theme,
+            background_renderer=self.draw_canvas_background,
         )
+        self.register_global_background(self.futures_window.window)
+        self.redraw_background_charts()
 
     def close(self) -> None:
         self.closed = True
+        if self.background_redraw_job:
+            try:
+                self.root.after_cancel(self.background_redraw_job)
+            except tk.TclError:
+                pass
         if self.refresh_job:
             try:
                 self.root.after_cancel(self.refresh_job)
@@ -2920,7 +3293,8 @@ class StockDynamicApp:
         canvas.delete("all")
         width = max(canvas.winfo_width(), 220)
         height = max(canvas.winfo_height(), 160)
-        self.draw_index_panel(canvas, name, 0, 0, width, height)
+        has_background = self.draw_canvas_background(canvas, width, height)
+        self.draw_index_panel(canvas, name, 0, 0, width, height, has_background)
 
     def draw_index_panel(
         self,
@@ -2930,6 +3304,7 @@ class StockDynamicApp:
         y0: float,
         x1: float,
         y1: float,
+        has_background: bool = False,
     ) -> None:
         theme = self.theme
         margin = 4
@@ -2941,7 +3316,14 @@ class StockDynamicApp:
         previous_close = self.index_previous_close.get(name)
         latest_value = all_candles[-1].close if all_candles else None
         color = trend_color(theme, latest_value, previous_close)
-        canvas.create_rectangle(x0, y0, x1, y1, fill=theme["surface_alt"], outline=theme["line"])
+        canvas.create_rectangle(
+            x0,
+            y0,
+            x1,
+            y1,
+            fill="" if has_background else theme["surface_alt"],
+            outline=theme["line"],
+        )
         canvas.create_text(
             x0 + 12,
             y0 + 18,
@@ -3026,6 +3408,7 @@ class StockDynamicApp:
         width = max(canvas.winfo_width(), 280)
         height = max(canvas.winfo_height(), 125)
         theme = self.theme
+        has_background = self.draw_canvas_background(canvas, width, height, theme)
         x0, y0, x1, y1 = 4, 4, width - 4, height - 4
         all_candles = self.us_candles.get(name, [])
         previous_close = self.us_previous_close.get(name)
@@ -3037,7 +3420,7 @@ class StockDynamicApp:
             y0,
             x1,
             y1,
-            fill=theme["surface_alt"],
+            fill="" if has_background else theme["surface_alt"],
             outline=theme["line"],
         )
         canvas.create_text(
@@ -3110,12 +3493,14 @@ class TaiwanFuturesWindow:
         refresh_interval: int,
         history_limit: int,
         theme_getter,
+        background_renderer=None,
     ) -> None:
         self.timeout = timeout
         self.retries = retries
         self.refresh_interval = refresh_interval
         self.history_limit = history_limit
         self.theme_getter = theme_getter
+        self.background_renderer = background_renderer
         self.candles: dict[str, list[MarketCandle]] = defaultdict(list)
         self.grains: dict[str, str] = {}
         self.previous_close: dict[str, float | None] = {}
@@ -3328,6 +3713,10 @@ class TaiwanFuturesWindow:
         theme = self.theme_getter()
         width = max(canvas.winfo_width(), 320)
         height = max(canvas.winfo_height(), 220)
+        has_background = bool(
+            self.background_renderer
+            and self.background_renderer(canvas, width, height, theme)
+        )
         x0, y0, x1, y1 = 4, 4, width - 4, height - 4
         all_candles = self.candles.get(name, [])
         previous_close = self.previous_close.get(name)
@@ -3339,7 +3728,7 @@ class TaiwanFuturesWindow:
             y0,
             x1,
             y1,
-            fill=theme["surface_alt"],
+            fill="" if has_background else theme["surface_alt"],
             outline=theme["line"],
         )
         canvas.create_text(
