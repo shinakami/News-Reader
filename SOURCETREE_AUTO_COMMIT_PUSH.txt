@@ -1,0 +1,50 @@
+News-Reader：SourceTree 自動 Commit / Push Hook
+================================================
+
+用途
+----
+這是一個 SourceTree「自訂動作」，按一次即可依目前 Git 狀態：
+
+1. 核對目前分支、origin 遠端與所有檔案變更。
+2. 檢查是否有合併衝突，並確認遠端分支沒有領先本機。
+3. 使用 git add --all 加入所有未被 .gitignore 排除的修改、新增及刪除。
+4. Python 檔案有變更時先執行編譯檢查。
+5. 根據異動檔案自動產生 Commit 訊息。
+6. Commit 後 Push 至目前分支；沒有 upstream 時會自動設定 origin。
+
+安全限制
+--------
+- .gitignore 內的 .env、虛擬環境、快取及腳本產生的 HTML 不會提交。
+- 新增 .env、私鑰、憑證或 credentials/secrets 類檔案時會停止。
+- 有合併衝突、detached HEAD 或遠端領先時會停止，不會自動覆寫遠端。
+- 如果沒有檔案變更但本機已有尚未 Push 的 Commit，仍會協助 Push。
+
+在 SourceTree 加入 Hook
+-----------------------
+1. 開啟 News-Reader 專案。
+2. 進入「工具」>「選項」>「自訂動作」。
+3. 按「新增」，設定：
+
+   選單標題：News-Reader 自動 Commit 並 Push
+   執行指令碼：
+   C:\Users\shina_chung\Documents\News-Reader\run_sourcetree_auto_commit_push.cmd
+
+   參數：留空
+
+4. 不要勾選「在獨立視窗執行」，並勾選「顯示完整輸出」，儲存設定。
+5. 之後在 SourceTree 上方選單執行：
+   「動作」>「自訂動作」>「News-Reader 自動 Commit 並 Push」。
+6. 輸出顯示 Completed 後按 SourceTree 的「重新整理」。
+
+終端測試（不 Commit、不 Push）
+-----------------------------
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tools\sourcetree-auto-commit-push.ps1 -DryRun
+
+指定 Commit 訊息（選用）
+-----------------------
+.\run_sourcetree_auto_commit_push.cmd -Message "fix: describe the change"
+
+注意
+----
+這個功能不會在每次儲存檔案時偷偷 Commit；它是由 SourceTree 手動啟動的一鍵動作，
+可讓你在 Push 前看見狀態與檢查結果，避免錯誤內容被自動送上 GitHub。
