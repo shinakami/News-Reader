@@ -21,6 +21,7 @@ from tkinter import ttk
 from typing import Sequence
 import urllib.request
 import urllib.parse
+import urllib.error
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from news_reader.stock_monitor import (
@@ -401,68 +402,171 @@ def fetch_yahoo_candles(
     raise RuntimeError("Yahoo 歷史 K 線資料不足")
 
 
+def fetch_yahoo_tw_chart_items(
+    symbols: Sequence[str],
+    timeout: int,
+    retries: int,
+    period: str = "1m",
+    range_name: str = "1d",
+) -> dict[str, dict]:
+    """Fetch Yahoo Taiwan charts in bounded batches and return them by symbol."""
+    unique_symbols = list(dict.fromkeys(symbols))
+    if not unique_symbols:
+        return {}
+    attempts = max(0, retries) + 1
+    chunks = [
+        unique_symbols[index:index + 10]
+        for index in range(0, len(unique_symbols), 10)
+    ]
+
+    def fetch_chunk(chunk: list[str]) -> list[dict]:
+        encoded_symbols = urllib.parse.quote(
+            json.dumps(chunk, ensure_ascii=False, separators=(",", ":")),
+            safe="",
+        )
+        resource = (
+            f"{YAHOO_TW_CHART_URL};autoRefresh={int(time.time() * 1000)}"
+            f";period={period};range={range_name}"
+            f";symbols={encoded_symbols};type=null"
+        )
+        query = urllib.parse.urlencode(
+            {
+                "device": "desktop",
+                "ecma": "modern",
+                "intl": "tw",
+                "lang": "zh-Hant-TW",
+                "region": "TW",
+                "site": "finance",
+                "tz": "Asia/Taipei",
+                "returnMeta": "true",
+            }
+        )
+        request = urllib.request.Request(
+            f"{resource}?{query}",
+            headers={
+                "User-Agent": "Mozilla/5.0",
+                "Referer": "https://tw.stock.yahoo.com/",
+                "Cache-Control": "no-cache",
+                "Connection": "close",
+            },
+        )
+        last_error: Exception | None = None
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                return payload.get("data") or []
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code in {400, 404}:
+                    break
+            except (OSError, json.JSONDecodeError) as exc:
+                last_error = exc
+            if attempt < attempts - 1:
+                time.sleep(0.3 * (attempt + 1))
+        raise RuntimeError(f"Yahoo 台灣批次行情載入失敗：{last_error}")
+
+    def fetch_resilient_chunk(chunk: list[str]) -> list[dict]:
+        try:
+            return fetch_chunk(chunk)
+        except RuntimeError:
+            if len(chunk) <= 1:
+                return []
+            middle = len(chunk) // 2
+            return [
+                *fetch_resilient_chunk(chunk[:middle]),
+                *fetch_resilient_chunk(chunk[middle:]),
+            ]
+
+    items: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as executor:
+        futures = [
+            executor.submit(fetch_resilient_chunk, chunk)
+            for chunk in chunks
+        ]
+        for future in as_completed(futures):
+            rows = future.result()
+            for item in rows:
+                symbol = item.get("symbol")
+                if symbol:
+                    items[symbol] = item
+    if not items:
+        raise RuntimeError("Yahoo 台灣批次行情未回傳任何資料")
+    return items
+
+
+def security_quote_from_yahoo_tw_item(
+    requested_symbol: str,
+    display_name: str,
+    item: dict | None,
+) -> SecurityQuote:
+    chart = (item or {}).get("chart") or {}
+    meta = chart.get("meta") or {}
+    quote = chart.get("quote") or {}
+    price = to_float(str(quote.get("price") or ""))
+    refreshed_text = str(quote.get("refreshedTs") or "")
+    timestamp: int | None = None
+    if refreshed_text and refreshed_text != "-":
+        try:
+            timestamp = int(
+                datetime.fromisoformat(
+                    refreshed_text.replace("Z", "+00:00")
+                ).timestamp()
+            )
+        except ValueError:
+            pass
+    if timestamp is None and meta.get("regularMarketTime"):
+        timestamp = int(meta["regularMarketTime"])
+    market_time = (
+        datetime.fromtimestamp(timestamp).strftime("%m/%d %H:%M:%S")
+        if timestamp
+        else "--"
+    )
+    symbol = requested_symbol
+    if "." in requested_symbol:
+        base = requested_symbol.split(".", 1)[0]
+        exchange = str(meta.get("exchange") or "")
+        if exchange == "TWO":
+            symbol = f"{base}.TWO"
+        elif exchange in {"TAI", "TWSE"}:
+            symbol = f"{base}.TW"
+    return SecurityQuote(
+        symbol=symbol,
+        name=display_name or str(meta.get("name") or requested_symbol),
+        price=price,
+        previous_close=to_float(
+            str(
+                quote.get("previousClose")
+                or meta.get("chartPreviousClose")
+                or meta.get("previousClose")
+                or ""
+            )
+        ),
+        open_price=to_float(str(quote.get("openPrice") or "")),
+        high=to_float(str(quote.get("dayHighPrice") or "")),
+        low=to_float(str(quote.get("dayLowPrice") or "")),
+        volume=to_int(str(quote.get("volume") or "")),
+        market_time=market_time,
+        market_timestamp=timestamp,
+        source="Yahoo 股市" if price is not None else "Yahoo 股市（暫無資料）",
+    )
+
+
 def fetch_yahoo_security_quote(
     symbol: str,
     display_name: str,
     timeout: int,
     retries: int,
 ) -> SecurityQuote:
-    encoded = urllib.parse.quote(symbol, safe="")
-    url = (
-        "https://query1.finance.yahoo.com/v8/finance/chart/"
-        f"{encoded}?range=1d&interval=1m"
+    items = fetch_yahoo_tw_chart_items([symbol], timeout, retries)
+    quote = security_quote_from_yahoo_tw_item(
+        symbol,
+        display_name,
+        items.get(symbol),
     )
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0", "Connection": "close"},
-    )
-    attempts = max(0, retries) + 1
-    last_error: Exception | None = None
-    for attempt in range(attempts):
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            results = payload.get("chart", {}).get("result") or []
-            if not results:
-                raise RuntimeError(
-                    payload.get("chart", {}).get("error")
-                    or "Yahoo quote returned no result"
-                )
-            result = results[0]
-            meta = result.get("meta", {})
-            quote_sets = result.get("indicators", {}).get("quote") or []
-            closes = (quote_sets[0].get("close") or []) if quote_sets else []
-            price = to_float(str(meta.get("regularMarketPrice", "")))
-            if price is None:
-                valid_closes = [value for value in closes if value is not None]
-                price = float(valid_closes[-1]) if valid_closes else None
-            timestamp = meta.get("regularMarketTime")
-            market_time = "--"
-            if timestamp:
-                market_time = datetime.fromtimestamp(timestamp).strftime("%m/%d %H:%M")
-            return SecurityQuote(
-                symbol=symbol,
-                name=display_name or meta.get("shortName") or symbol,
-                price=price,
-                previous_close=to_float(
-                    str(
-                        meta.get("chartPreviousClose")
-                        or meta.get("previousClose")
-                        or ""
-                    )
-                ),
-                open_price=to_float(str(meta.get("regularMarketOpen", ""))),
-                high=to_float(str(meta.get("regularMarketDayHigh", ""))),
-                low=to_float(str(meta.get("regularMarketDayLow", ""))),
-                volume=to_int(str(meta.get("regularMarketVolume", ""))),
-                market_time=market_time,
-                market_timestamp=int(timestamp) if timestamp else None,
-            )
-        except (OSError, json.JSONDecodeError, RuntimeError) as exc:
-            last_error = exc
-        if attempt < attempts - 1:
-            time.sleep(0.25 * (attempt + 1))
-    raise RuntimeError(f"{symbol} Yahoo 行情載入失敗：{last_error}")
+    if quote.price is None:
+        raise RuntimeError(f"{symbol} Yahoo 台灣行情暫無資料")
+    return quote
 
 
 def fetch_yahoo_security_quotes(
@@ -472,36 +576,15 @@ def fetch_yahoo_security_quotes(
 ) -> list[SecurityQuote]:
     if not symbols:
         return []
-    rows: dict[str, SecurityQuote] = {}
-    with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as executor:
-        futures = {
-            executor.submit(
-                fetch_yahoo_security_quote,
-                symbol,
-                name,
-                timeout,
-                retries,
-            ): (symbol, name)
-            for symbol, name in symbols.items()
-        }
-        for future in as_completed(futures):
-            symbol, name = futures[future]
-            try:
-                rows[symbol] = future.result()
-            except RuntimeError:
-                rows[symbol] = SecurityQuote(
-                    symbol=symbol,
-                    name=name,
-                    price=None,
-                    previous_close=None,
-                    open_price=None,
-                    high=None,
-                    low=None,
-                    volume=None,
-                    market_time="--",
-                    market_timestamp=None,
-                    source="Yahoo Finance（暫無資料）",
-                )
+    items = fetch_yahoo_tw_chart_items(list(symbols), timeout, retries)
+    rows = {
+        symbol: security_quote_from_yahoo_tw_item(
+            symbol,
+            name,
+            items.get(symbol),
+        )
+        for symbol, name in symbols.items()
+    }
     return [rows[symbol] for symbol in symbols]
 
 
@@ -512,28 +595,12 @@ def fetch_taiwan_security_quote(
     retries: int,
 ) -> SecurityQuote:
     requested_name = "" if display_name == code else display_name
-    for symbol in (f"{code}.TW", f"{code}.TWO"):
-        try:
-            return fetch_yahoo_security_quote(
-                symbol,
-                requested_name,
-                timeout,
-                retries,
-            )
-        except RuntimeError:
-            continue
-    return SecurityQuote(
-        symbol=f"{code}.TW",
-        name=display_name or code,
-        price=None,
-        previous_close=None,
-        open_price=None,
-        high=None,
-        low=None,
-        volume=None,
-        market_time="--",
-        market_timestamp=None,
-        source="Yahoo Finance（暫無資料）",
+    symbol = f"{code}.TW"
+    items = fetch_yahoo_tw_chart_items([symbol], timeout, retries)
+    return security_quote_from_yahoo_tw_item(
+        symbol,
+        requested_name,
+        items.get(symbol),
     )
 
 
@@ -544,22 +611,19 @@ def fetch_taiwan_security_quotes(
 ) -> dict[str, SecurityQuote]:
     if not symbols:
         return {}
-    rows: dict[str, SecurityQuote] = {}
-    with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as executor:
-        futures = {
-            executor.submit(
-                fetch_taiwan_security_quote,
-                code,
-                name,
-                timeout,
-                retries,
-            ): code
-            for code, name in symbols.items()
-        }
-        for future in as_completed(futures):
-            code = futures[future]
-            rows[code] = future.result()
-    return rows
+    requested = {
+        f"{code}.TW": (code, "" if name == code else name)
+        for code, name in symbols.items()
+    }
+    items = fetch_yahoo_tw_chart_items(list(requested), timeout, retries)
+    return {
+        code: security_quote_from_yahoo_tw_item(
+            symbol,
+            display_name,
+            items.get(symbol),
+        )
+        for symbol, (code, display_name) in requested.items()
+    }
 
 
 def fetch_yahoo_tw_futures(
@@ -2590,7 +2654,7 @@ class StockDynamicApp:
             f"美股行情時間：{market_time}｜K 線模式：{mode_text}"
         )
         self.source_text.set(
-            f"來源：Yahoo Finance｜更新頻率：{self.interval} 秒"
+            f"來源：Yahoo 股市批次報價／Yahoo Finance K 線｜更新頻率：{self.interval} 秒"
         )
         self.draw_us_charts()
 
@@ -2763,7 +2827,7 @@ class StockDynamicApp:
             source = (
                 quote.source
                 if quote.price is not None
-                else "Yahoo Finance（暫無資料）"
+                else "Yahoo 股市（暫無資料）"
             )
             self.tw_stock_tree.insert(
                 "",
