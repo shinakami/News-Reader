@@ -1,0 +1,77 @@
+AI 盤勢分析功能使用說明
+========================
+
+一、啟動方式
+
+1. 雙擊 run_stock_dynamic.bat。
+2. Dashboard 右上角點選「AI 盤勢分析」。
+3. 視窗會讀取目前的台股四大指數、觀察個股、ETF，以及最新公布的
+   三大法人和上市上櫃漲跌家數，建立今日市場摘要。
+4. 「重新分析」才會重新取得資料並呼叫雲端模型；Dashboard 每隔數秒的
+   行情更新不會自動消耗 LLM 額度。
+5. 問題中提到「新聞」、「網路」、「最新消息」、「搜尋」，或使用「怎麼了」、
+   「為什麼」、「原因」、「異動」、「大漲／大跌」等事件型問法時，程式會
+   優先透過專案既有的 Google News RSS 取得新聞標題、日期與來源，再交給
+   Gemini 搭配行情分析。RSS 無資料時才嘗試 Google Search grounding，避免
+   搜尋額度不足讓整段回答失敗。一般數據問題不會自動搜尋網路。
+   若 Gemini 一般免費額度也暫時到達上限，視窗仍會顯示個股行情與 RSS 新聞
+   來源，並標示尚未由 LLM 綜合，不會只留下 429 錯誤或空白回答。
+6. 如果 Gemini 回傳 MAX_TOKENS，程式會自動從中斷處接續最多兩次、合併並
+   去除重複片段，再一次顯示完整答案；不需要手動輸入「繼續」。
+7. AI 市場快照會自行載入美股四大指數、ADR、美股觀察清單與台指近月四大
+   期貨，不需要先切換美股頁面或開啟期貨視窗。期貨優先使用 Yahoo 盤中資料；
+   單一商品暫無成交或 Yahoo 整體失敗時，會改用 TAIFEX 最近可用日 K。
+
+二、未設定 API Key 時
+
+功能仍會用本機規則顯示市場摘要，但無法回答自由輸入的問題。
+若網路中斷、免費額度用完或 Gemini 回傳錯誤，也會保留本機摘要。
+
+三、申請及設定 Gemini API Key
+
+1. 前往 Google AI Studio：https://aistudio.google.com/apikey
+2. 登入 Google 帳號並建立 API Key。
+3. 建議方式：開啟專案根目錄的 .env.local，填入：
+
+   GEMINI_API_KEY=貼上你的金鑰
+   GEMINI_MODEL=gemini-3.6-flash
+
+   .env.local 已被 .gitignore 排除，不會被加入 Commit。儲存後重新開啟
+   Dashboard 即可，不需要啟用虛擬環境或設定 Windows 全域變數。
+
+4. 若只想在 PowerShell 目前視窗設定：
+
+   $env:GEMINI_API_KEY="貼上你的金鑰"
+   .\.venv\Scripts\python.exe .\main.py dynamic
+
+   關閉該 PowerShell 視窗後，這個設定會失效。
+
+5. 若要保存到目前 Windows 使用者環境：
+
+   [Environment]::SetEnvironmentVariable(
+       "GEMINI_API_KEY",
+       "貼上你的金鑰",
+       "User"
+   )
+
+   設定後請關閉並重新開啟終端或 Dashboard。
+
+設定優先順序為：程式參數、Windows／PowerShell 環境變數、.env.local、預設值。
+程式預設使用 gemini-3.6-flash。若要改用其他可用模型，可另外設定：
+
+   $env:GEMINI_MODEL="模型名稱"
+
+四、安全與限制
+
+- API Key 可從 .env.local、GEMINI_API_KEY 或 GOOGLE_API_KEY 讀取；.env.local 不列入版控。
+- 請勿把金鑰貼進程式碼、Git Commit、對話問題或截圖。
+- 程式只傳送 Dashboard 的公開市場快照和你輸入的問題；不要輸入個資、帳號或持倉資料。
+- 免費方案可能有速率和每日額度限制，且服務條款可能調整。
+- 行情、法人與漲跌家數可能有延遲或資料日不同，視窗會顯示快照時間與資料限制。
+- 所有摘要與回答僅供資訊參考，不構成投資建議。
+
+五、虛擬環境與 Pillow
+
+所有 run_*.bat 現在會優先使用專案內的 .venv\Scripts\python.exe，避免系統 Python
+缺少 Pillow 而出現「No module named 'PIL'」。若專案尚無 .venv，批次檔才會退回
+使用系統的 python；此時請先建立虛擬環境並安裝 requirements.txt。

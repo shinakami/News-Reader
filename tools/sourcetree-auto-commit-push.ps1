@@ -151,10 +151,33 @@ try {
         )
         $sensitiveFiles = @($newFiles | Where-Object {
             $candidate = $_.ToString().Replace("\", "/").ToLowerInvariant()
-            @($sensitivePatterns | Where-Object { $candidate -match $_ }).Count -gt 0
+            $isEnvironmentExample = $candidate -match '(^|/)\.env(?:\.[^/]+)*\.example$'
+            -not $isEnvironmentExample -and
+                @($sensitivePatterns | Where-Object { $candidate -match $_ }).Count -gt 0
         })
         if ($sensitiveFiles.Count -gt 0) {
             throw "Sensitive new files were detected and nothing was committed:`n$($sensitiveFiles -join [Environment]::NewLine)"
+        }
+
+        $environmentExamples = @($newFiles | Where-Object {
+            $_.ToString().Replace("\", "/").ToLowerInvariant() -match '(^|/)\.env(?:\.[^/]+)*\.example$'
+        })
+        $unsafeExampleEntries = @()
+        foreach ($examplePath in $environmentExamples) {
+            $fullExamplePath = Join-Path $script:RepoRoot $examplePath
+            foreach ($line in Get-Content -LiteralPath $fullExamplePath) {
+                if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*)\s*=\s*(.+?)\s*$') {
+                    $value = $Matches[2].Trim().Trim('"').Trim("'")
+                    $isPlaceholder = [string]::IsNullOrWhiteSpace($value) -or
+                        $value -match '(?i)(your[_-]|replace[_-]?me|placeholder|example|dummy|fake|changeme|<[^>]+>)'
+                    if (-not $isPlaceholder) {
+                        $unsafeExampleEntries += "$examplePath`: $($Matches[1])"
+                    }
+                }
+            }
+        }
+        if ($unsafeExampleEntries.Count -gt 0) {
+            throw "Environment example files contain values that do not look like placeholders:`n$($unsafeExampleEntries -join [Environment]::NewLine)"
         }
 
         $pythonChanged = @($changedPaths | Where-Object { $_.ToString().ToLowerInvariant().EndsWith(".py") }).Count -gt 0

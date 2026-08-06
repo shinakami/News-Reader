@@ -1,4 +1,6 @@
 @echo off
 cd /d "%~dp0"
-python main.py dashboard --open
+set "NEWS_READER_PYTHON=%~dp0.venv\Scripts\python.exe"
+if not exist "%NEWS_READER_PYTHON%" set "NEWS_READER_PYTHON=python"
+"%NEWS_READER_PYTHON%" main.py dashboard --open
 pause

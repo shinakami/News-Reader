@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from PIL import Image, ImageColor, ImageOps, ImageTk
 
+from news_reader.market_ai import MarketAiWindow
 from news_reader.stock_monitor import (
     INDICES,
     YAHOO_INDICES,
@@ -1508,9 +1509,15 @@ class StockDynamicApp:
         self.us_chart_mode = ""
         self.us_previous_close: dict[str, float | None] = {}
         self.us_stock_symbols = dict(DEFAULT_US_STOCKS)
+        self.us_index_rows: dict[str, SecurityQuote] = {}
+        self.adr_rows: dict[str, SecurityQuote] = {}
+        self.us_stock_rows: dict[str, SecurityQuote] = {}
         self.us_history_loaded_at = 0.0
         self.market_window: MarketOverviewWindow | None = None
         self.futures_window: TaiwanFuturesWindow | None = None
+        self.ai_market_window: MarketAiWindow | None = None
+        self.last_quote_status = "正在載入行情"
+        self.last_quote_source = source
         self.background_settings_window: tk.Toplevel | None = None
         self.background_image: Image.Image | None = None
         self.background_image_path = ""
@@ -1606,6 +1613,12 @@ class StockDynamicApp:
             textvariable=self.market_page_button_text,
             style="Flat.TButton",
             command=self.switch_market_page,
+        ).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            actions,
+            text="AI 盤勢分析",
+            style="Flat.TButton",
+            command=self.open_ai_market,
         ).pack(side="left", padx=(0, 8))
         ttk.Button(
             actions,
@@ -2691,6 +2704,319 @@ class StockDynamicApp:
         self.register_global_background(self.futures_window.window)
         self.redraw_background_charts()
 
+    def open_ai_market(self) -> None:
+        if self.ai_market_window and not self.ai_market_window.closed:
+            self.ai_market_window.window.deiconify()
+            self.ai_market_window.window.lift()
+            self.ai_market_window.window.focus_force()
+            return
+        self.ai_market_window = MarketAiWindow(
+            parent=self.root,
+            snapshot_loader=self.collect_ai_market_snapshot,
+            theme_getter=lambda: self.theme,
+        )
+        self.register_global_background(self.ai_market_window.window)
+        self.redraw_global_backgrounds()
+
+    @staticmethod
+    def current_market_session() -> str:
+        now = datetime.now()
+        if now.weekday() >= 5:
+            return "休市日"
+        current = now.time()
+        if current < clock_time(8, 30):
+            return "盤前"
+        if current <= clock_time(13, 35):
+            return "盤中"
+        return "收盤後"
+
+    @staticmethod
+    def ai_quote_row(
+        name: str,
+        price: float | None,
+        previous_close: float | None,
+        market_time: str,
+    ) -> dict[str, object]:
+        change_percent = None
+        if price is not None and previous_close:
+            change_percent = (price - previous_close) / previous_close * 100
+        return {
+            "name": name,
+            "price": price,
+            "previous_close": previous_close,
+            "change_percent": change_percent,
+            "market_time": market_time,
+        }
+
+    def collect_ai_market_snapshot(self) -> dict[str, object]:
+        """Collect a compact public-data snapshot outside Tk's UI thread."""
+        def safe_items(mapping) -> list[tuple[object, object]]:
+            for _attempt in range(3):
+                try:
+                    return list(mapping.items())
+                except RuntimeError:
+                    time.sleep(0.01)
+            return []
+
+        errors: list[str] = []
+        institutions: InstitutionSnapshot | None = None
+        breadth: MarketBreadth | None = None
+        futures_payload = None
+        us_market_quotes: list[SecurityQuote] | None = None
+        requested_us_symbols = {
+            **dict(safe_items(self.us_stock_symbols)),
+            **TAIWAN_ADR_SYMBOLS,
+            **{
+                symbol: name
+                for name, symbol in US_INDEX_SYMBOLS.items()
+            },
+        }
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            institution_future = executor.submit(
+                fetch_institution_trades, self.timeout, self.verify_ssl
+            )
+            breadth_future = executor.submit(
+                fetch_market_breadth, self.timeout, self.verify_ssl
+            )
+            futures_future = executor.submit(
+                fetch_yahoo_tw_futures,
+                YAHOO_TW_FUTURE_SYMBOLS,
+                self.timeout,
+                self.retries,
+                self.history_limit,
+            )
+            us_market_future = executor.submit(
+                fetch_yahoo_security_quotes,
+                requested_us_symbols,
+                self.timeout,
+                self.retries,
+            )
+            try:
+                institutions = institution_future.result()
+            except Exception as exc:
+                errors.append(f"三大法人資料：{exc}")
+            try:
+                breadth = breadth_future.result()
+            except Exception as exc:
+                errors.append(f"市場漲跌家數：{exc}")
+            try:
+                futures_payload = futures_future.result()
+            except Exception as exc:
+                errors.append(f"台指近月期貨：{exc}")
+            try:
+                us_market_quotes = us_market_future.result()
+            except Exception as exc:
+                errors.append(f"美股／ADR 行情：{exc}")
+
+        candles = {name: list(rows) for name, rows in safe_items(self.candles)}
+        previous_closes = dict(self.index_previous_close)
+        grains = dict(self.candle_grains)
+        indices = []
+        for name in INDICES.values():
+            rows = candles.get(name, [])
+            latest = rows[-1] if rows else None
+            item = self.ai_quote_row(
+                name,
+                latest.close if latest else None,
+                previous_closes.get(name),
+                latest.label if latest else "--",
+            )
+            item["grain"] = grains.get(name, "--")
+            indices.append(item)
+
+        def quote_row(name: str, quote) -> dict[str, object]:
+            return self.ai_quote_row(
+                name,
+                quote.price,
+                quote.previous_close,
+                quote.market_time,
+            )
+
+        stocks = [
+            quote_row(f"{code} {quote.name}", quote)
+            for code, quote in safe_items(self.tw_stock_rows)
+            if quote.price is not None
+        ]
+        stocks.sort(key=lambda row: abs(float(row["change_percent"] or 0)), reverse=True)
+        etfs = [
+            quote_row(f"{code} {quote.name}", quote)
+            for code, quote in safe_items(self.etf_rows)
+            if quote.price is not None
+        ]
+        etfs.sort(key=lambda row: abs(float(row["change_percent"] or 0)), reverse=True)
+
+        fresh_us_by_symbol = {
+            quote.symbol: quote
+            for quote in (us_market_quotes or [])
+        }
+        cached_us_indices = dict(safe_items(self.us_index_rows))
+        cached_adrs = dict(safe_items(self.adr_rows))
+        cached_us_stocks = dict(safe_items(self.us_stock_rows))
+        us_indices = []
+        for name, symbol in US_INDEX_SYMBOLS.items():
+            quote = fresh_us_by_symbol.get(symbol) or cached_us_indices.get(symbol)
+            if quote and quote.price is not None:
+                us_indices.append(quote_row(name, quote))
+        adrs = []
+        for symbol, name in TAIWAN_ADR_SYMBOLS.items():
+            quote = fresh_us_by_symbol.get(symbol) or cached_adrs.get(symbol)
+            if quote and quote.price is not None:
+                adrs.append(quote_row(f"{symbol} {name}", quote))
+        us_stocks = []
+        for symbol, name in safe_items(self.us_stock_symbols):
+            quote = fresh_us_by_symbol.get(symbol) or cached_us_stocks.get(symbol)
+            if quote and quote.price is not None:
+                us_stocks.append(quote_row(f"{symbol} {name}", quote))
+        adrs.sort(key=lambda row: abs(float(row["change_percent"] or 0)), reverse=True)
+        us_stocks.sort(key=lambda row: abs(float(row["change_percent"] or 0)), reverse=True)
+
+        futures: list[dict[str, object]] = []
+        if futures_payload:
+            (
+                future_histories,
+                future_grains,
+                future_previous_closes,
+                _future_refreshed_times,
+                future_errors,
+            ) = futures_payload
+            for name in TAIWAN_FUTURE_CHART_NAMES:
+                rows = future_histories.get(name, [])
+                latest = rows[-1] if rows else None
+                if latest:
+                    item = self.ai_quote_row(
+                        name,
+                        latest.close,
+                        future_previous_closes.get(name),
+                        latest.label,
+                    )
+                    item["grain"] = future_grains.get(name, "Yahoo 5 分 K")
+                    futures.append(item)
+            available_future_names = {
+                str(item.get("name")) for item in futures
+            }
+            for name, contract in TAIFEX_FRONT_MONTHS.items():
+                if name in available_future_names:
+                    continue
+                try:
+                    rows, grain = fetch_taifex_front_month_candles(
+                        contract,
+                        self.timeout,
+                        self.retries,
+                        self.verify_ssl,
+                        self.history_limit,
+                    )
+                except Exception as exc:
+                    errors.append(f"台指近月期貨：{name} 備援失敗：{exc}")
+                    continue
+                latest = rows[-1] if rows else None
+                if not latest:
+                    continue
+                previous_close = rows[-2].close if len(rows) >= 2 else None
+                item = self.ai_quote_row(
+                    name,
+                    latest.close,
+                    previous_close,
+                    latest.label,
+                )
+                item["grain"] = f"TAIFEX {grain}（Yahoo 暫無成交備援）"
+                futures.append(item)
+                available_future_names.add(name)
+            for error in future_errors:
+                error_name = error.split("：", 1)[0]
+                if error_name not in available_future_names:
+                    errors.append(f"台指近月期貨：{error}")
+        if not futures_payload:
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                fallback_jobs = {
+                    name: executor.submit(
+                        fetch_taifex_front_month_candles,
+                        contract,
+                        self.timeout,
+                        self.retries,
+                        self.verify_ssl,
+                        self.history_limit,
+                    )
+                    for name, contract in TAIFEX_FRONT_MONTHS.items()
+                }
+                for name, future in fallback_jobs.items():
+                    try:
+                        rows, grain = future.result()
+                    except Exception as exc:
+                        errors.append(
+                            f"台指近月期貨：{name} TAIFEX 備援失敗：{exc}"
+                        )
+                        continue
+                    latest = rows[-1] if rows else None
+                    if not latest:
+                        continue
+                    previous_close = rows[-2].close if len(rows) >= 2 else None
+                    item = self.ai_quote_row(
+                        name,
+                        latest.close,
+                        previous_close,
+                        latest.label,
+                    )
+                    item["grain"] = f"TAIFEX {grain}（Yahoo 連線備援）"
+                    futures.append(item)
+        futures_window = self.futures_window
+        if not futures and futures_window and not futures_window.closed:
+            future_candles = {
+                name: list(rows)
+                for name, rows in safe_items(futures_window.candles)
+            }
+            for name in TAIWAN_FUTURE_CHART_NAMES:
+                rows = future_candles.get(name, [])
+                latest = rows[-1] if rows else None
+                if latest:
+                    futures.append(
+                        self.ai_quote_row(
+                            name,
+                            latest.close,
+                            futures_window.previous_close.get(name),
+                            latest.label,
+                        )
+                    )
+
+        institution_rows = []
+        if institutions:
+            institution_rows = [
+                {
+                    "name": row.name,
+                    "buy": row.buy_amount / 100_000_000,
+                    "sell": row.sell_amount / 100_000_000,
+                    "net": row.net_amount / 100_000_000,
+                    "date": institutions.market_date or "--",
+                }
+                for row in institutions.rows
+            ]
+        breadth_row = None
+        if breadth:
+            up, flat, down = breadth.totals
+            breadth_row = {
+                "up": up,
+                "flat": flat,
+                "down": down,
+                "twse_date": breadth.twse_date or "--",
+                "tpex_date": breadth.tpex_date or "--",
+            }
+        return {
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "session": self.current_market_session(),
+            "active_page": "美股" if self.active_page == "us" else "台股",
+            "quote_source": self.last_quote_source,
+            "quote_status": self.last_quote_status,
+            "indices": indices,
+            "breadth": breadth_row,
+            "institutions": institution_rows,
+            "stocks": stocks[:12],
+            "etfs": etfs[:10],
+            "futures": futures,
+            "us_indices": us_indices,
+            "adrs": adrs[:10],
+            "us_stocks": us_stocks[:12],
+            "errors": errors,
+        }
+
     def close(self) -> None:
         self.closed = True
         if self.background_redraw_job:
@@ -2945,6 +3271,8 @@ class StockDynamicApp:
         desired_mode: str | None = None,
     ) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.last_quote_status = f"本機時間：{now}｜行情時間：{api_time or '--'}"
+        self.last_quote_source = data_source
         self.status_text.set(f"本機時間：{now}｜行情時間：{api_time or '--'}")
         self.source_text.set(f"來源：{data_source}｜更新頻率：{self.interval} 秒")
 
@@ -2986,6 +3314,17 @@ class StockDynamicApp:
         desired_mode: str,
         history_reloaded: bool,
     ) -> None:
+        available_times = [
+            quote.market_time
+            for quote in index_quotes
+            if quote.market_time != "--"
+        ]
+        market_time = max(available_times) if available_times else "--"
+        self.last_quote_status = f"美股行情時間：{market_time}"
+        self.last_quote_source = "Yahoo 股市批次報價／Yahoo Finance K 線"
+        self.us_index_rows = {quote.symbol: quote for quote in index_quotes}
+        self.adr_rows = {quote.symbol: quote for quote in adr_quotes}
+        self.us_stock_rows = {quote.symbol: quote for quote in stock_quotes}
         if history_reloaded:
             for name in US_CHART_NAMES:
                 self.us_candles[name] = histories.get(name, [])[-self.history_limit:]
@@ -3016,12 +3355,6 @@ class StockDynamicApp:
 
         self.update_security_tree(self.adr_tree, adr_quotes)
         self.update_security_tree(self.us_stock_tree, stock_quotes)
-        available_times = [
-            quote.market_time
-            for quote in index_quotes
-            if quote.market_time != "--"
-        ]
-        market_time = max(available_times) if available_times else "--"
         mode_text = "盤中 5 分 K" if desired_mode == "intraday" else "日 K"
         self.status_text.set(
             f"美股行情時間：{market_time}｜K 線模式：{mode_text}"
