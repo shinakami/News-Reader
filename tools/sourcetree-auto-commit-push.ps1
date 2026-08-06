@@ -35,9 +35,13 @@ function Invoke-RepoGit {
 }
 
 function Get-AutomaticCommitMessage {
-    param([string[]]$Paths)
+    param(
+        [string[]]$Paths,
+        [string]$ChangeText = ""
+    )
 
     $normalized = @($Paths | ForEach-Object { $_.Replace("\", "/").ToLowerInvariant() })
+    $changeSummary = $ChangeText.ToLowerInvariant()
     if ($normalized.Count -eq 0) {
         return "chore: update project files"
     }
@@ -56,6 +60,19 @@ function Get-AutomaticCommitMessage {
     }
     if (@($normalized | Where-Object { $_ -match '(^|/)(test|tests)/|(^|/)test_[^/]+\.py$' }).Count -eq $normalized.Count) {
         return "test: update automated tests"
+    }
+    if ($changeSummary -match 'get-automaticcommitmessage|commit message|commitmessage') {
+        return "chore: improve automatic commit naming"
+    }
+    if ($changeSummary -match 'gemini|llm|ai[_ -]?(analysis|assistant|summary)|prompt') {
+        return "feat: enhance AI market analysis"
+    }
+    if (@($normalized | Where-Object { $_ -match 'requirements[^/]*\.txt$|pyproject\.toml$|package(-lock)?\.json$' }).Count -gt 0) {
+        return "build: update project dependencies"
+    }
+    if (@($normalized | Where-Object { $_ -match '(^|/)run_[^/]+\.(bat|cmd|ps1)$' }).Count -gt 0 -and
+        @($normalized | Where-Object { $_ -notmatch '(^|/)run_[^/]+\.(bat|cmd|ps1)$' }).Count -eq 0) {
+        return "chore: update launcher scripts"
     }
     if (@($normalized | Where-Object { $_ -match 'stock_dynamic|stock_monitor|stock_market_dashboard' }).Count -gt 0) {
         return "feat: update stock dashboard"
@@ -116,7 +133,15 @@ try {
             Invoke-RepoGit -Arguments @("status", "--porcelain=v1", "--untracked-files=all") |
                 ForEach-Object { $_.ToString().Substring(3).Trim('"') }
         )
-        $previewMessage = if ($Message) { $Message.Trim() } else { Get-AutomaticCommitMessage -Paths $previewPaths }
+        $previewChangeText = (@(Invoke-RepoGit -Arguments @(
+            "diff", "--unified=0", "--no-ext-diff", "--", ".",
+            ":(exclude)*.html", ":(exclude)*.lock"
+        )) -join "`n")
+        $previewMessage = if ($Message) {
+            $Message.Trim()
+        } else {
+            Get-AutomaticCommitMessage -Paths $previewPaths -ChangeText $previewChangeText
+        }
         Write-Host "Dry run only; no files were staged, committed, or pushed." -ForegroundColor Green
         if ($status.Count -gt 0) {
             Write-Host "Proposed commit message: $previewMessage" -ForegroundColor Green
@@ -199,7 +224,15 @@ try {
             throw "No committable changes remain after applying .gitignore."
         }
 
-        $commitMessage = if ($Message) { $Message.Trim() } else { Get-AutomaticCommitMessage -Paths $stagedPaths }
+        $stagedChangeText = (@(Invoke-RepoGit -Arguments @(
+            "diff", "--cached", "--unified=0", "--no-ext-diff", "--", ".",
+            ":(exclude)*.html", ":(exclude)*.lock"
+        )) -join "`n")
+        $commitMessage = if ($Message) {
+            $Message.Trim()
+        } else {
+            Get-AutomaticCommitMessage -Paths $stagedPaths -ChangeText $stagedChangeText
+        }
         if ([string]::IsNullOrWhiteSpace($commitMessage)) {
             throw "The commit message is empty."
         }
