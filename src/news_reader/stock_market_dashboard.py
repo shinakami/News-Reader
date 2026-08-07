@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Sequence
 
+from news_reader.cli_types import positive_int
 from news_reader.stock_monitor import fetch_market_data
 
 
@@ -368,7 +369,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default="auto",
         help="資料來源，預設 auto；TWSE 失敗時自動切 Yahoo。",
     )
-    parser.add_argument("--timeout", type=int, default=15, help="網路逾時秒數，預設 15。")
+    parser.add_argument("--timeout", type=positive_int, default=15, help="網路逾時秒數，預設 15。")
     parser.add_argument("--retries", type=int, default=2, help="連線失敗時重試次數，預設 2。")
     parser.add_argument("--no-etf", action="store_true", help="不顯示 ETF 區塊。")
     parser.add_argument("--verify-ssl", action="store_true", help="強制驗證 TWSE SSL 憑證。")
@@ -404,6 +405,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
 
     output_path = Path(args.output).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(html_text, encoding="utf-8")
     print(f"Dashboard 已產生：{output_path.resolve()}")
 

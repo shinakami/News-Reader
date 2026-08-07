@@ -19,6 +19,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Sequence
 
+from news_reader.cli_types import positive_int
+
 
 TWSE_API_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 
@@ -591,7 +593,7 @@ def print_quotes(
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="時刻監控台股四大指數動態。")
     parser.add_argument("-i", "--interval", type=int, default=10, help="更新間隔秒數，預設 10。")
-    parser.add_argument("--timeout", type=int, default=15, help="網路逾時秒數，預設 15。")
+    parser.add_argument("--timeout", type=positive_int, default=15, help="網路逾時秒數，預設 15。")
     parser.add_argument("--retries", type=int, default=2, help="連線失敗時重試次數，預設 2。")
     parser.add_argument(
         "--source",

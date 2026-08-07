@@ -159,6 +159,12 @@ def render_snapshot(snapshot: dict) -> str:
             f"行情標記 {row.get('market_time', '--')}"
         )
     breadth = snapshot.get("breadth")
+    if breadth:
+        breadth = {
+            **breadth,
+            "twse_date": breadth.get("twse_date") or "--",
+            "tpex_date": breadth.get("tpex_date") or "--",
+        }
     lines.append("\n【上市上櫃漲跌家數】")
     if breadth:
         lines.append(

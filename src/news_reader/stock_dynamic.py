@@ -27,6 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from PIL import Image, ImageColor, ImageOps, ImageTk
 
+from news_reader.cli_types import positive_int
 from news_reader.market_ai import MarketAiWindow
 from news_reader.stock_monitor import (
     INDICES,
@@ -4839,7 +4840,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="啟動股票動態視窗介面。")
     parser.add_argument("-i", "--interval", type=int, default=10, help="更新間隔秒數，預設 10。")
     parser.add_argument("--source", choices=["auto", "twse", "yahoo"], default="auto", help="資料來源。")
-    parser.add_argument("--timeout", type=int, default=15, help="網路逾時秒數，預設 15。")
+    parser.add_argument("--timeout", type=positive_int, default=15, help="網路逾時秒數，預設 15。")
     parser.add_argument("--retries", type=int, default=2, help="連線失敗時重試次數，預設 2。")
     parser.add_argument("--history", type=int, default=80, help="K 線圖保留資料點數，預設 80。")
     parser.add_argument("--no-etf", action="store_true", help="不顯示 ETF 資料。")

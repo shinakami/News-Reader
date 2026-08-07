@@ -1,6 +1,7 @@
 """News Reader package."""
 
 __all__ = [
+    "cli_types",
     "llm_client",
     "market_ai",
     "news",

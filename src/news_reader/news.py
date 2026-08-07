@@ -17,6 +17,8 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Sequence
 
+from news_reader.cli_types import positive_int
+
 
 DEFAULT_QUERIES = ["台灣", "國際", "科技", "商業"]
 DEFAULT_DASHBOARD_OUTPUT = "news_dashboard.html"
@@ -65,6 +67,8 @@ def format_date(value: str) -> str:
 
 
 def fetch_feed(url: str, timeout: int) -> ET.Element:
+    if timeout <= 0:
+        raise ValueError("timeout must be greater than zero")
     request = urllib.request.Request(
         url,
         headers={"User-Agent": "News Reader/1.0 (+https://news.google.com/rss)"},
@@ -75,6 +79,8 @@ def fetch_feed(url: str, timeout: int) -> ET.Element:
 
 
 def read_news(query: str, language: str, region: str, limit: int, timeout: int) -> list[NewsItem]:
+    if limit <= 0:
+        raise ValueError("limit must be greater than zero")
     root = fetch_feed(build_feed_url(query, language, region), timeout)
     items: list[NewsItem] = []
 
@@ -284,10 +290,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         nargs="*",
         help="要搜尋的新聞關鍵字；未提供時會抓台灣、國際、科技、商業。",
     )
-    parser.add_argument("-n", "--limit", type=int, default=5, help="每個分類列出幾則新聞。")
+    parser.add_argument("-n", "--limit", type=positive_int, default=5, help="每個分類列出幾則新聞。")
     parser.add_argument("--language", default="zh-TW", help="新聞語言，預設 zh-TW。")
     parser.add_argument("--region", default="TW", help="新聞地區，預設 TW。")
-    parser.add_argument("--timeout", type=int, default=15, help="網路逾時秒數。")
+    parser.add_argument("--timeout", type=positive_int, default=15, help="網路逾時秒數。")
     parser.add_argument("--links", action="store_true", help="同時列出新聞連結。")
     parser.add_argument("--dashboard", action="store_true", help="同時產生新聞 HTML Dashboard。")
     parser.add_argument("--open", action="store_true", help="產生 Dashboard 後用預設瀏覽器開啟。")
