@@ -1688,7 +1688,7 @@ class StockDynamicApp:
 
         self.root.title("Stock Dynamic")
         self.root.geometry("1240x840")
-        self.root.minsize(760, 620)
+        self.root.minsize(680, 520)
         self.root.configure(bg=self.theme["bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -1698,11 +1698,12 @@ class StockDynamicApp:
         self.market_page_button_text = tk.StringVar(value="切換美股")
         self.style = ttk.Style()
         self.card_widgets: list[ttk.Frame] = []
-        self.current_layout: tuple[int, bool] | None = None
+        self.current_layout: tuple[int, bool, bool, bool] | None = None
         self.build_ui()
         self.register_global_background(self.root)
         self.apply_theme()
         self.root.bind("<Configure>", self.on_root_resize)
+        self.root.bind("<MouseWheel>", self.on_page_mousewheel, add="+")
         self.refresh()
         self.root.after(200, self.process_results)
 
@@ -1712,75 +1713,80 @@ class StockDynamicApp:
 
         header = ttk.Frame(self.root, style="TFrame")
         header.pack(fill="x")
-        header_inner = ttk.Frame(header, style="Header.TFrame", padding=(22, 16))
-        header_inner.pack(fill="x", padx=16, pady=(16, 10))
+        self.header_inner = ttk.Frame(header, style="Header.TFrame", padding=(22, 16))
+        self.header_inner.pack(fill="x", padx=16, pady=(16, 10))
 
         title = ttk.Label(
-            header_inner,
+            self.header_inner,
             text="Stock Dynamic",
             style="Header.TLabel",
             font=("Segoe UI", 22, "bold"),
         )
         title.grid(row=0, column=0, sticky="w")
         subtitle = ttk.Label(
-            header_inner,
+            self.header_inner,
             textvariable=self.subtitle_text,
             style="Muted.TLabel",
             font=("Microsoft JhengHei UI", 10),
         )
         subtitle.grid(row=1, column=0, sticky="w", pady=(2, 0))
-        ttk.Label(
-            header_inner,
+        self.status_label = ttk.Label(
+            self.header_inner,
             textvariable=self.status_text,
             style="Muted.TLabel",
             font=("Microsoft JhengHei UI", 10),
-        ).grid(row=2, column=0, sticky="w", pady=(8, 0))
-        ttk.Label(
-            header_inner,
+        )
+        self.status_label.grid(row=2, column=0, sticky="w", pady=(8, 0))
+        self.source_label = ttk.Label(
+            self.header_inner,
             textvariable=self.source_text,
             style="Muted.TLabel",
             font=("Microsoft JhengHei UI", 10),
-        ).grid(row=2, column=1, sticky="e", pady=(8, 0))
-        actions = ttk.Frame(header_inner, style="Header.TFrame")
-        actions.grid(row=0, column=1, sticky="e")
-        ttk.Button(
-            actions,
-            text="市場籌碼",
-            style="Flat.TButton",
-            command=self.open_market_overview,
-        ).pack(side="left", padx=(0, 8))
-        ttk.Button(
-            actions,
-            text="台指期貨",
-            style="Flat.TButton",
-            command=self.open_taiwan_futures,
-        ).pack(side="left", padx=(0, 8))
-        ttk.Button(
-            actions,
-            textvariable=self.market_page_button_text,
-            style="Flat.TButton",
-            command=self.switch_market_page,
-        ).pack(side="left", padx=(0, 8))
-        ttk.Button(
-            actions,
-            text="AI 盤勢分析",
-            style="Flat.TButton",
-            command=self.open_ai_market,
-        ).pack(side="left", padx=(0, 8))
-        ttk.Button(
-            actions,
-            text="背景設定",
-            style="Flat.TButton",
-            command=self.open_background_settings,
-        ).pack(side="left", padx=(0, 8))
-        refresh_button = ttk.Button(
-            actions,
-            text="立即更新",
-            style="Flat.TButton",
-            command=self.refresh_all,
         )
-        refresh_button.pack(side="left")
-        header_inner.columnconfigure(0, weight=1)
+        self.source_label.grid(row=2, column=1, sticky="e", pady=(8, 0))
+        self.header_actions = ttk.Frame(self.header_inner, style="Header.TFrame")
+        self.header_actions.grid(row=0, column=1, sticky="e")
+        self.header_action_buttons = [
+            ttk.Button(
+                self.header_actions,
+                text="市場籌碼",
+                style="Flat.TButton",
+                command=self.open_market_overview,
+            ),
+            ttk.Button(
+                self.header_actions,
+                text="台指期貨",
+                style="Flat.TButton",
+                command=self.open_taiwan_futures,
+            ),
+            ttk.Button(
+                self.header_actions,
+                textvariable=self.market_page_button_text,
+                style="Flat.TButton",
+                command=self.switch_market_page,
+            ),
+            ttk.Button(
+                self.header_actions,
+                text="AI 盤勢分析",
+                style="Flat.TButton",
+                command=self.open_ai_market,
+            ),
+            ttk.Button(
+                self.header_actions,
+                text="背景設定",
+                style="Flat.TButton",
+                command=self.open_background_settings,
+            ),
+            ttk.Button(
+                self.header_actions,
+                text="立即更新",
+                style="Flat.TButton",
+                command=self.refresh_all,
+            ),
+        ]
+        for index, button in enumerate(self.header_action_buttons):
+            button.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
+        self.header_inner.columnconfigure(0, weight=1)
 
         self.page_host = ttk.Frame(self.root, style="TFrame")
         self.page_host.pack(fill="both", expand=True)
@@ -1788,8 +1794,11 @@ class StockDynamicApp:
         self.page_host.columnconfigure(0, weight=1)
         self.taiwan_page = ttk.Frame(self.page_host, style="TFrame")
         self.taiwan_page.grid(row=0, column=0, sticky="nsew")
+        self.taiwan_scroll_canvas, self.taiwan_content = self.create_scrollable_page(
+            self.taiwan_page
+        )
 
-        self.card_frame = ttk.Frame(self.taiwan_page, style="TFrame")
+        self.card_frame = ttk.Frame(self.taiwan_content, style="TFrame")
         self.card_frame.pack(fill="x", padx=16, pady=8)
         self.cards: dict[str, dict[str, ttk.Label]] = {}
         for idx, name in enumerate(INDICES.values()):
@@ -1823,8 +1832,9 @@ class StockDynamicApp:
             self.cards[name] = {"value": value, "change": change, "time": time_label, "accent": accent}
             self.card_frame.columnconfigure(idx, weight=1, uniform="cards")
 
-        self.body = ttk.Frame(self.taiwan_page, style="TFrame")
+        self.body = ttk.Frame(self.taiwan_content, style="TFrame", height=520)
         self.body.pack(fill="both", expand=True, padx=16, pady=(4, 16))
+        self.body.pack_propagate(False)
         self.body.columnconfigure(0, weight=3)
         self.body.columnconfigure(1, weight=2)
         self.body.rowconfigure(0, weight=1)
@@ -2007,7 +2017,33 @@ class StockDynamicApp:
         self.main_pane.add(self.right_panel, stretch="always", minsize=360)
         self.build_us_page()
         self.taiwan_page.tkraise()
-        self.layout_for_width(self.root.winfo_width() or 1240)
+        initial_width = self.root.winfo_width()
+        self.layout_for_width(initial_width if initial_width > 1 else 1240)
+
+    def create_scrollable_page(
+        self,
+        parent: ttk.Frame,
+    ) -> tuple[tk.Canvas, ttk.Frame]:
+        canvas = tk.Canvas(parent, highlightthickness=0, bd=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        content = ttk.Frame(canvas, style="TFrame")
+        window_item = canvas.create_window(0, 0, window=content, anchor="nw")
+        content.bind(
+            "<Configure>",
+            lambda _event, target=canvas: target.configure(
+                scrollregion=target.bbox("all")
+            ),
+        )
+        canvas.bind(
+            "<Configure>",
+            lambda event, target=canvas, item=window_item: target.itemconfigure(
+                item, width=event.width
+            ),
+        )
+        return canvas, content
 
     def create_taiwan_stock_tree(self, parent: ttk.Frame) -> ttk.Treeview:
         table_frame = ttk.Frame(parent, style="Card.TFrame")
@@ -2080,8 +2116,11 @@ class StockDynamicApp:
     def build_us_page(self) -> None:
         self.us_page = ttk.Frame(self.page_host, style="TFrame")
         self.us_page.grid(row=0, column=0, sticky="nsew")
+        self.us_scroll_canvas, self.us_content = self.create_scrollable_page(
+            self.us_page
+        )
 
-        self.us_card_frame = ttk.Frame(self.us_page, style="TFrame")
+        self.us_card_frame = ttk.Frame(self.us_content, style="TFrame")
         self.us_card_frame.pack(fill="x", padx=16, pady=8)
         self.us_cards: dict[str, dict[str, ttk.Label | tk.Frame]] = {}
         self.us_card_widgets: list[ttk.Frame] = []
@@ -2131,8 +2170,9 @@ class StockDynamicApp:
             self.us_card_frame.columnconfigure(index, weight=1, uniform="us_cards")
 
         self.us_main_pane = tk.PanedWindow(
-            self.us_page,
+            self.us_content,
             orient="horizontal",
+            height=520,
             sashwidth=8,
             sashrelief="raised",
             showhandle=True,
@@ -2311,21 +2351,90 @@ class StockDynamicApp:
             self.layout_for_width(event.width)
             self.schedule_background_redraw()
 
+    def on_page_mousewheel(self, event: tk.Event) -> str | None:
+        if isinstance(event.widget, ttk.Treeview):
+            return None
+        canvas = (
+            self.us_scroll_canvas
+            if self.active_page == "us"
+            else self.taiwan_scroll_canvas
+        )
+        canvas.yview_scroll(-int(event.delta / 120), "units")
+        return "break"
+
+    def refresh_page_scrollregions(self) -> None:
+        for canvas in (self.taiwan_scroll_canvas, self.us_scroll_canvas):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
     def layout_for_width(self, width: int, force: bool = False) -> None:
         card_columns = 4
         if width < 620:
             card_columns = 1
-        elif width < 980:
+        elif width < 840:
             card_columns = 2
 
-        stacked_body = width < 1120
-        layout_key = (card_columns, stacked_body)
+        stacked_body = width < 900
+        compact_charts = width < 760
+        stacked_header = width < 1120
+        layout_key = (card_columns, stacked_body, compact_charts, stacked_header)
         if self.current_layout == layout_key and not force:
             return
         self.current_layout = layout_key
+        self.source_label.configure(
+            wraplength=max(300, width - 80),
+            justify="left",
+        )
+        self.status_label.configure(
+            wraplength=max(300, width - 80),
+            justify="left",
+        )
+
+        self.header_actions.grid_forget()
+        self.source_label.grid_forget()
+        if stacked_header:
+            self.source_label.grid(
+                row=3,
+                column=0,
+                columnspan=2,
+                sticky="w",
+                pady=(4, 0),
+            )
+            self.header_actions.grid(
+                row=4,
+                column=0,
+                columnspan=2,
+                sticky="ew",
+                pady=(10, 0),
+            )
+        else:
+            self.source_label.grid(row=2, column=1, sticky="e", pady=(8, 0))
+            self.header_actions.grid(row=0, column=1, sticky="e")
+        action_columns = 3 if stacked_header else 6
+        for row in range(2):
+            self.header_actions.rowconfigure(row, weight=0)
+        for column in range(6):
+            self.header_actions.columnconfigure(column, weight=0, uniform="")
+        for index, button in enumerate(self.header_action_buttons):
+            button.grid_forget()
+            row, column = divmod(index, action_columns)
+            button.grid(
+                row=row,
+                column=column,
+                sticky="ew",
+                padx=(0 if column == 0 else 4, 0),
+                pady=(0 if row == 0 else 4, 0),
+            )
+        for column in range(action_columns):
+            self.header_actions.columnconfigure(
+                column, weight=1, uniform="header_actions"
+            )
+        self.style.configure(
+            "Flat.TButton",
+            padding=(8, 5) if width < 900 else (14, 7),
+        )
 
         for column in range(4):
-            self.card_frame.columnconfigure(column, weight=0)
+            self.card_frame.columnconfigure(column, weight=0, uniform="")
         for row in range(4):
             self.card_frame.rowconfigure(row, weight=0)
         for idx, frame in enumerate(self.card_widgets):
@@ -2341,7 +2450,7 @@ class StockDynamicApp:
             self.card_frame.rowconfigure(row, weight=1)
 
         for column in range(4):
-            self.us_card_frame.columnconfigure(column, weight=0)
+            self.us_card_frame.columnconfigure(column, weight=0, uniform="")
         for row in range(4):
             self.us_card_frame.rowconfigure(row, weight=0)
         for index, frame in enumerate(self.us_card_widgets):
@@ -2384,8 +2493,76 @@ class StockDynamicApp:
             self.us_main_pane.configure(orient="horizontal")
             self.main_pane.grid(row=0, column=0, columnspan=2, sticky="nsew")
 
+        body_height = 1050 if compact_charts else 860 if stacked_body else 520
+        self.body.configure(height=body_height)
+        self.us_main_pane.configure(height=body_height)
+        for row_pane in self.chart_rows:
+            row_pane.configure(orient="vertical" if compact_charts else "horizontal")
+            self.chart_pane.paneconfigure(
+                row_pane,
+                minsize=210 if compact_charts else 150,
+            )
+            for canvas in row_pane.panes():
+                row_pane.paneconfigure(
+                    canvas,
+                    minsize=100 if compact_charts else 180,
+                )
+
+        for row in range(4):
+            self.us_chart_grid.rowconfigure(row, weight=0, uniform="")
+        for column in range(2):
+            self.us_chart_grid.columnconfigure(column, weight=0, uniform="")
+        for index, name in enumerate(US_CHART_NAMES):
+            canvas = self.us_chart_canvases[name]
+            canvas.grid_forget()
+            row = index if compact_charts else index // 2
+            column = 0 if compact_charts else index % 2
+            canvas.grid(
+                row=row,
+                column=column,
+                sticky="nsew",
+                padx=(0 if column == 0 else 4, 4 if column == 0 and not compact_charts else 0),
+                pady=(0 if row == 0 else 4, 0),
+            )
+        us_rows = 4 if compact_charts else 2
+        us_columns = 1 if compact_charts else 2
+        for row in range(us_rows):
+            self.us_chart_grid.rowconfigure(row, weight=1, uniform="us_chart_rows")
+        for column in range(us_columns):
+            self.us_chart_grid.columnconfigure(column, weight=1, uniform="us_charts")
+
         self.draw_chart()
         self.draw_us_charts()
+        self.root.after_idle(self.position_responsive_panes)
+        self.root.after_idle(self.refresh_page_scrollregions)
+
+    def position_responsive_panes(self) -> None:
+        stacked = self.current_layout[1] if self.current_layout else False
+        for pane, leading_min, trailing_min in (
+            (self.main_pane, 360, 360),
+            (self.us_main_pane, 440, 380),
+        ):
+            divider = int(pane.cget("sashwidth")) + 4
+            if stacked:
+                available = pane.winfo_height()
+                position = max(
+                    leading_min,
+                    min(
+                        int(available * 0.55),
+                        available - trailing_min - divider,
+                    ),
+                )
+                pane.sash_place(0, 0, position)
+            else:
+                available = pane.winfo_width()
+                position = max(
+                    leading_min,
+                    min(
+                        int(available * 0.56),
+                        available - trailing_min - divider,
+                    ),
+                )
+                pane.sash_place(0, position, 0)
 
     def open_background_settings(self) -> None:
         if self.background_settings_window and self.background_settings_window.winfo_exists():
@@ -2721,6 +2898,8 @@ class StockDynamicApp:
     def apply_theme(self) -> None:
         theme = self.theme
         self.root.configure(bg=theme["bg"])
+        self.taiwan_scroll_canvas.configure(bg=theme["bg"])
+        self.us_scroll_canvas.configure(bg=theme["bg"])
 
         self.style.configure("TFrame", background=theme["bg"])
         self.style.configure("Header.TFrame", background=theme["surface"])
@@ -2784,10 +2963,12 @@ class StockDynamicApp:
         self.active_page = "us" if self.active_page == "taiwan" else "taiwan"
         if self.active_page == "us":
             self.us_page.tkraise()
+            self.us_scroll_canvas.yview_moveto(0)
             self.market_page_button_text.set("返回台股")
             self.subtitle_text.set("美股四大指數、ADR 與美國個股")
         else:
             self.taiwan_page.tkraise()
+            self.taiwan_scroll_canvas.yview_moveto(0)
             self.market_page_button_text.set("切換美股")
             self.subtitle_text.set("台股四大指數、ETF 與個股即時看板")
         self.current_layout = None
@@ -4309,30 +4490,59 @@ class MarketOverviewWindow:
         self.loading = False
         self.closed = False
         self.breadth: MarketBreadth | None = None
+        self.institutions: InstitutionSnapshot | None = None
 
         self.window = tk.Toplevel(parent)
-        self.window.title("市場籌碼｜三大法人與漲跌家數")
-        self.window.geometry("900x680")
-        self.window.minsize(700, 560)
+        self.window.title("市場籌碼 Dashboard｜上市、上櫃與三大法人")
+        self.window.geometry("1280x900")
+        self.window.minsize(680, 520)
+        try:
+            self.window.state("zoomed")
+        except tk.TclError:
+            pass
         self.window.protocol("WM_DELETE_WINDOW", self.close)
 
         self.status_text = tk.StringVar(value="正在載入最新資料...")
         self.institution_date_text = tk.StringVar(value="三大法人：載入中")
         self.breadth_date_text = tk.StringVar(value="市場漲跌：載入中")
+        self.twse_up_text = tk.StringVar(value="--")
+        self.tpex_up_text = tk.StringVar(value="--")
+        self.limit_up_text = tk.StringVar(value="--")
+        self.limit_down_text = tk.StringVar(value="--")
+        self.institution_net_text = tk.StringVar(value="--")
+        self.market_layout_width = 0
         self.build_ui()
+        self.window.after_idle(self.set_initial_dashboard_split)
         self.apply_theme()
         self.refresh()
         self.window.after(200, self.process_results)
 
     def build_ui(self) -> None:
-        self.frame = ttk.Frame(self.window, style="TFrame", padding=16)
-        self.frame.pack(fill="both", expand=True)
+        self.scroll_canvas = tk.Canvas(self.window, highlightthickness=0, bd=0)
+        self.scrollbar = ttk.Scrollbar(
+            self.window,
+            orient="vertical",
+            command=self.scroll_canvas.yview,
+        )
+        self.scroll_canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.scrollbar.pack(side="right", fill="y")
+        self.scroll_canvas.pack(side="left", fill="both", expand=True)
+        self.frame = ttk.Frame(self.scroll_canvas, style="TFrame", padding=14)
+        self.frame_window = self.scroll_canvas.create_window(
+            0,
+            0,
+            window=self.frame,
+            anchor="nw",
+        )
+        self.frame.bind("<Configure>", self.on_dashboard_content_resize)
+        self.scroll_canvas.bind("<Configure>", self.on_dashboard_viewport_resize)
+        self.window.bind("<MouseWheel>", self.on_dashboard_mousewheel)
 
         header = ttk.Frame(self.frame, style="Header.TFrame", padding=(18, 14))
         header.pack(fill="x", pady=(0, 10))
         ttk.Label(
             header,
-            text="市場籌碼",
+            text="市場籌碼 Dashboard",
             style="Header.TLabel",
             font=("Microsoft JhengHei UI", 20, "bold"),
         ).grid(row=0, column=0, sticky="w")
@@ -4350,9 +4560,83 @@ class MarketOverviewWindow:
         ).grid(row=0, column=1, rowspan=2, sticky="e")
         header.columnconfigure(0, weight=1)
 
-        institution_panel = ttk.Frame(self.frame, style="Card.TFrame", padding=16)
-        institution_panel.pack(fill="x", pady=(0, 10))
-        institution_header = ttk.Frame(institution_panel, style="Card.TFrame")
+        self.kpi_frame = ttk.Frame(self.frame, style="TFrame")
+        self.kpi_frame.pack(fill="x", pady=(0, 10))
+        self.kpi_cards: list[ttk.Frame] = []
+        kpis = (
+            ("上市上漲", self.twse_up_text, "含上市漲停"),
+            ("上櫃上漲", self.tpex_up_text, "含上櫃漲停"),
+            ("漲停家數", self.limit_up_text, "上市＋上櫃"),
+            ("跌停家數", self.limit_down_text, "上市＋上櫃"),
+            ("法人合計", self.institution_net_text, "買賣超（億元）"),
+        )
+        for index, (title, variable, note) in enumerate(kpis):
+            card = ttk.Frame(self.kpi_frame, style="Card.TFrame", padding=(14, 10))
+            self.kpi_cards.append(card)
+            card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 5, 0))
+            ttk.Label(
+                card,
+                text=title,
+                style="Muted.TLabel",
+                font=("Microsoft JhengHei UI", 9, "bold"),
+            ).pack(anchor="w")
+            ttk.Label(
+                card,
+                textvariable=variable,
+                style="CardValue.TLabel",
+                font=("Segoe UI", 20, "bold"),
+            ).pack(anchor="w", pady=(2, 0))
+            ttk.Label(
+                card,
+                text=note,
+                style="Muted.TLabel",
+                font=("Microsoft JhengHei UI", 8),
+            ).pack(anchor="w")
+            self.kpi_frame.columnconfigure(index, weight=1, uniform="market_kpi")
+
+        self.dashboard_pane = tk.PanedWindow(
+            self.frame,
+            orient="vertical",
+            height=680,
+            sashwidth=7,
+            sashrelief="raised",
+            showhandle=True,
+            bd=0,
+            opaqueresize=True,
+        )
+        self.dashboard_pane.pack(fill="both", expand=True)
+
+        self.breadth_panel = ttk.Frame(self.dashboard_pane, style="Card.TFrame", padding=14)
+        self.dashboard_pane.add(self.breadth_panel, stretch="always", minsize=245)
+        breadth_header = ttk.Frame(self.breadth_panel, style="Card.TFrame")
+        breadth_header.pack(fill="x")
+        ttk.Label(
+            breadth_header,
+            text="市場廣度｜上市與上櫃",
+            style="CardTitle.TLabel",
+            font=("Microsoft JhengHei UI", 13, "bold"),
+        ).pack(side="left")
+        ttk.Label(
+            breadth_header,
+            textvariable=self.breadth_date_text,
+            style="Muted.TLabel",
+            font=("Microsoft JhengHei UI", 9),
+        ).pack(side="right")
+        self.breadth_charts = ttk.Frame(self.breadth_panel, style="Card.TFrame")
+        self.breadth_charts.pack(fill="both", expand=True, pady=(8, 0))
+        self.breadth_charts.rowconfigure(0, weight=1)
+        for column in range(2):
+            self.breadth_charts.columnconfigure(column, weight=1, uniform="breadth")
+        self.twse_breadth_canvas = tk.Canvas(self.breadth_charts, height=245, highlightthickness=0)
+        self.tpex_breadth_canvas = tk.Canvas(self.breadth_charts, height=245, highlightthickness=0)
+        self.twse_breadth_canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        self.tpex_breadth_canvas.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        self.twse_breadth_canvas.bind("<Configure>", lambda _event: self.draw_breadth_charts())
+        self.tpex_breadth_canvas.bind("<Configure>", lambda _event: self.draw_breadth_charts())
+
+        self.institution_panel = ttk.Frame(self.dashboard_pane, style="Card.TFrame", padding=14)
+        self.dashboard_pane.add(self.institution_panel, stretch="always", minsize=380)
+        institution_header = ttk.Frame(self.institution_panel, style="Card.TFrame")
         institution_header.pack(fill="x")
         ttk.Label(
             institution_header,
@@ -4367,9 +4651,33 @@ class MarketOverviewWindow:
             font=("Microsoft JhengHei UI", 9),
         ).pack(side="right")
 
+        self.institution_charts = ttk.Frame(self.institution_panel, style="Card.TFrame")
+        self.institution_charts.pack(fill="both", expand=True, pady=(8, 8))
+        self.institution_charts.rowconfigure(0, weight=1)
+        self.institution_charts.columnconfigure(0, weight=3, uniform="institution")
+        self.institution_charts.columnconfigure(1, weight=2, uniform="institution")
+        self.institution_flow_canvas = tk.Canvas(
+            self.institution_charts,
+            height=190,
+            highlightthickness=0,
+        )
+        self.institution_net_canvas = tk.Canvas(
+            self.institution_charts,
+            height=190,
+            highlightthickness=0,
+        )
+        self.institution_flow_canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 5))
+        self.institution_net_canvas.grid(row=0, column=1, sticky="nsew", padx=(5, 0))
+        self.institution_flow_canvas.bind(
+            "<Configure>", lambda _event: self.draw_institution_charts()
+        )
+        self.institution_net_canvas.bind(
+            "<Configure>", lambda _event: self.draw_institution_charts()
+        )
+
         columns = ("institution", "buy", "sell", "net")
         self.institution_tree = ttk.Treeview(
-            institution_panel,
+            self.institution_panel,
             columns=columns,
             show="headings",
             height=3,
@@ -4385,39 +4693,147 @@ class MarketOverviewWindow:
             self.institution_tree.heading(column, text=headings[column])
             self.institution_tree.column(column, width=widths[column], anchor="e")
         self.institution_tree.column("institution", anchor="w")
-        self.institution_tree.pack(fill="x", pady=(8, 0))
-
-        breadth_panel = ttk.Frame(self.frame, style="Card.TFrame", padding=16)
-        breadth_panel.pack(fill="both", expand=True)
-        breadth_header = ttk.Frame(breadth_panel, style="Card.TFrame")
-        breadth_header.pack(fill="x")
-        ttk.Label(
-            breadth_header,
-            text="全台上市＋上櫃漲跌家數（含漲跌停）",
-            style="CardTitle.TLabel",
-            font=("Microsoft JhengHei UI", 13, "bold"),
-        ).pack(side="left")
-        ttk.Label(
-            breadth_header,
-            textvariable=self.breadth_date_text,
-            style="Muted.TLabel",
-            font=("Microsoft JhengHei UI", 9),
-        ).pack(side="right")
-        self.breadth_canvas = tk.Canvas(
-            breadth_panel,
-            height=280,
-            highlightthickness=0,
+        self.institution_tree.pack(fill="x")
+        self.institution_xscrollbar = ttk.Scrollbar(
+            self.institution_panel,
+            orient="horizontal",
+            command=self.institution_tree.xview,
         )
-        self.breadth_canvas.pack(fill="both", expand=True, pady=(8, 0))
-        self.breadth_canvas.bind("<Configure>", lambda _event: self.draw_breadth_chart())
+        self.institution_tree.configure(
+            xscrollcommand=self.institution_xscrollbar.set
+        )
+        self.institution_xscrollbar.pack(fill="x")
+
+    def on_dashboard_content_resize(self, _event: tk.Event) -> None:
+        self.scroll_canvas.configure(scrollregion=self.scroll_canvas.bbox("all"))
+
+    def on_dashboard_viewport_resize(self, event: tk.Event) -> None:
+        self.scroll_canvas.itemconfigure(self.frame_window, width=event.width)
+        self.layout_dashboard_for_width(event.width)
+
+    def on_dashboard_mousewheel(self, event: tk.Event) -> None:
+        self.scroll_canvas.yview_scroll(-int(event.delta / 120), "units")
+
+    def layout_dashboard_for_width(self, width: int) -> None:
+        layout_width = 680 if width < 760 else 1000 if width < 1100 else 1280
+        if self.market_layout_width == layout_width:
+            return
+        self.market_layout_width = layout_width
+
+        kpi_columns = 2 if width < 760 else 3 if width < 1100 else 5
+        for row in range(3):
+            self.kpi_frame.rowconfigure(row, weight=0)
+        for column in range(5):
+            self.kpi_frame.columnconfigure(column, weight=0, uniform="")
+        for index, card in enumerate(self.kpi_cards):
+            card.grid_forget()
+            row, column = divmod(index, kpi_columns)
+            card.grid(
+                row=row,
+                column=column,
+                sticky="nsew",
+                padx=(0 if column == 0 else 5, 0),
+                pady=(0 if row == 0 else 5, 0),
+            )
+        for column in range(kpi_columns):
+            self.kpi_frame.columnconfigure(
+                column, weight=1, uniform="market_kpi"
+            )
+
+        stacked = width < 850
+        for frame in (self.breadth_charts, self.institution_charts):
+            for row in range(2):
+                frame.rowconfigure(row, weight=0)
+            for column in range(2):
+                frame.columnconfigure(column, weight=0, uniform="")
+
+        self.twse_breadth_canvas.grid_forget()
+        self.tpex_breadth_canvas.grid_forget()
+        self.institution_flow_canvas.grid_forget()
+        self.institution_net_canvas.grid_forget()
+        if stacked:
+            self.twse_breadth_canvas.grid(
+                row=0, column=0, sticky="nsew", pady=(0, 5)
+            )
+            self.tpex_breadth_canvas.grid(
+                row=1, column=0, sticky="nsew", pady=(5, 0)
+            )
+            self.institution_flow_canvas.grid(
+                row=0, column=0, sticky="nsew", pady=(0, 5)
+            )
+            self.institution_net_canvas.grid(
+                row=1, column=0, sticky="nsew", pady=(5, 0)
+            )
+            for frame in (self.breadth_charts, self.institution_charts):
+                frame.columnconfigure(0, weight=1)
+                frame.rowconfigure(0, weight=1)
+                frame.rowconfigure(1, weight=1)
+            self.dashboard_pane.configure(height=1180)
+            self.dashboard_pane.paneconfigure(self.breadth_panel, minsize=520)
+            self.dashboard_pane.paneconfigure(self.institution_panel, minsize=620)
+        else:
+            self.twse_breadth_canvas.grid(
+                row=0, column=0, sticky="nsew", padx=(0, 5)
+            )
+            self.tpex_breadth_canvas.grid(
+                row=0, column=1, sticky="nsew", padx=(5, 0)
+            )
+            self.institution_flow_canvas.grid(
+                row=0, column=0, sticky="nsew", padx=(0, 5)
+            )
+            self.institution_net_canvas.grid(
+                row=0, column=1, sticky="nsew", padx=(5, 0)
+            )
+            self.breadth_charts.rowconfigure(0, weight=1)
+            self.breadth_charts.columnconfigure(0, weight=1, uniform="breadth")
+            self.breadth_charts.columnconfigure(1, weight=1, uniform="breadth")
+            self.institution_charts.rowconfigure(0, weight=1)
+            self.institution_charts.columnconfigure(
+                0, weight=3, uniform="institution"
+            )
+            self.institution_charts.columnconfigure(
+                1, weight=2, uniform="institution"
+            )
+            self.dashboard_pane.configure(height=680)
+            self.dashboard_pane.paneconfigure(self.breadth_panel, minsize=245)
+            self.dashboard_pane.paneconfigure(self.institution_panel, minsize=380)
+        self.window.after_idle(self.set_initial_dashboard_split)
+        self.window.after_idle(
+            lambda: self.scroll_canvas.configure(
+                scrollregion=self.scroll_canvas.bbox("all")
+            )
+        )
+
+    def set_initial_dashboard_split(self) -> None:
+        if self.closed:
+            return
+        self.window.update_idletasks()
+        available = self.dashboard_pane.winfo_height()
+        stacked = self.scroll_canvas.winfo_width() < 850
+        breadth_min = 520 if stacked else 245
+        institution_min = 620 if stacked else 380
+        breadth_height = max(
+            breadth_min,
+            min(int(available * 0.45), available - institution_min),
+        )
+        self.dashboard_pane.sash_place(0, 0, breadth_height)
 
     def apply_theme(self) -> None:
         theme = self.theme_getter()
         self.window.configure(bg=theme["bg"])
+        self.scroll_canvas.configure(bg=theme["bg"])
+        self.dashboard_pane.configure(bg=theme["line"])
         self.institution_tree.tag_configure("up", foreground=theme["up"])
         self.institution_tree.tag_configure("down", foreground=theme["down"])
-        self.breadth_canvas.configure(bg=theme["surface"])
-        self.draw_breadth_chart()
+        for canvas in (
+            self.twse_breadth_canvas,
+            self.tpex_breadth_canvas,
+            self.institution_flow_canvas,
+            self.institution_net_canvas,
+        ):
+            canvas.configure(bg=theme["surface"])
+        self.draw_breadth_charts()
+        self.draw_institution_charts()
 
     def close(self) -> None:
         self.closed = True
@@ -4468,6 +4884,7 @@ class MarketOverviewWindow:
         self.institution_date_text.set(
             f"最新公布：{self.format_date(institutions.market_date)}｜單位：億元"
         )
+        self.institutions = institutions
         for item in self.institution_tree.get_children():
             self.institution_tree.delete(item)
         for row in institutions.rows:
@@ -4485,6 +4902,20 @@ class MarketOverviewWindow:
             )
 
         self.breadth = breadth
+        self.twse_up_text.set(f"{breadth.twse_up:,}")
+        self.tpex_up_text.set(f"{breadth.tpex_up:,}")
+        if breadth.dates_match:
+            self.limit_up_text.set(f"{breadth.limit_totals[0]:,}")
+            self.limit_down_text.set(f"{breadth.limit_totals[1]:,}")
+        else:
+            self.limit_up_text.set(
+                f"{breadth.twse_limit_up:,} / {breadth.tpex_limit_up:,}"
+            )
+            self.limit_down_text.set(
+                f"{breadth.twse_limit_down:,} / {breadth.tpex_limit_down:,}"
+            )
+        institution_net = sum(row.net_amount for row in institutions.rows) / 100_000_000
+        self.institution_net_text.set(fmt_signed(institution_net))
         twse_date = self.format_date(breadth.twse_date)
         tpex_date = self.format_date(breadth.tpex_date)
         if twse_date == tpex_date:
@@ -4494,120 +4925,111 @@ class MarketOverviewWindow:
         self.apply_theme()
         self.window.after(self.refresh_interval * 1000, self.refresh)
 
-    def draw_breadth_chart(self) -> None:
-        canvas = self.breadth_canvas
+    @staticmethod
+    def short_institution_name(value: str) -> str:
+        if "外資" in value:
+            return "外資"
+        if "投信" in value:
+            return "投信"
+        if "自營商" in value:
+            return "自營商"
+        return value[:8]
+
+    def draw_breadth_charts(self) -> None:
+        breadth = self.breadth
+        markets = (
+            (
+                self.twse_breadth_canvas,
+                "上市",
+                breadth.twse_date if breadth else "",
+                breadth.twse_up if breadth else 0,
+                breadth.twse_limit_up if breadth else 0,
+                breadth.twse_flat if breadth else 0,
+                breadth.twse_down if breadth else 0,
+                breadth.twse_limit_down if breadth else 0,
+            ),
+            (
+                self.tpex_breadth_canvas,
+                "上櫃",
+                breadth.tpex_date if breadth else "",
+                breadth.tpex_up if breadth else 0,
+                breadth.tpex_limit_up if breadth else 0,
+                breadth.tpex_flat if breadth else 0,
+                breadth.tpex_down if breadth else 0,
+                breadth.tpex_limit_down if breadth else 0,
+            ),
+        )
+        for values in markets:
+            self.draw_market_breadth_chart(*values)
+
+    def draw_market_breadth_chart(
+        self,
+        canvas: tk.Canvas,
+        market: str,
+        market_date: str,
+        up: int,
+        limit_up: int,
+        flat: int,
+        down: int,
+        limit_down: int,
+    ) -> None:
         canvas.delete("all")
         theme = self.theme_getter()
-        width = max(canvas.winfo_width(), 620)
-        height = max(canvas.winfo_height(), 260)
-        left, right, top, bottom = 58, 28, 26, 72
-        plot_width = width - left - right
-        plot_height = height - top - bottom
+        width = max(canvas.winfo_width(), 420)
+        height = max(canvas.winfo_height(), 220)
         canvas.create_rectangle(
-            left,
-            top,
-            width - right,
-            height - bottom,
+            1,
+            1,
+            width - 2,
+            height - 2,
             fill=theme["surface_alt"],
             outline=theme["line"],
         )
-        if self.breadth is None:
+        canvas.create_text(
+            14,
+            16,
+            text=f"{market}市場",
+            fill=theme["text"],
+            anchor="w",
+            font=("Microsoft JhengHei UI", 12, "bold"),
+        )
+        canvas.create_text(
+            width - 14,
+            16,
+            text=f"資料日 {self.format_date(market_date)}",
+            fill=theme["muted"],
+            anchor="e",
+            font=("Microsoft JhengHei UI", 8),
+        )
+        total = up + flat + down
+        if not market_date or total == 0:
             canvas.create_text(
                 width / 2,
                 height / 2,
-                text="正在載入市場漲跌家數...",
+                text=f"正在載入{market}市場資料...",
                 fill=theme["muted"],
-                font=("Microsoft JhengHei UI", 11),
+                font=("Microsoft JhengHei UI", 10),
             )
             return
 
-        breadth = self.breadth
-        if not breadth.dates_match:
-            canvas.create_text(
-                width / 2,
-                top + 22,
-                text="上市與上櫃資料日不同，為避免誤判不合併繪圖",
-                fill=theme["muted"],
-                font=("Microsoft JhengHei UI", 11, "bold"),
-            )
-            rows = (
-                (
-                    "上市",
-                    breadth.twse_date,
-                    breadth.twse_up,
-                    breadth.twse_limit_up,
-                    breadth.twse_flat,
-                    breadth.twse_down,
-                    breadth.twse_limit_down,
-                ),
-                (
-                    "上櫃",
-                    breadth.tpex_date,
-                    breadth.tpex_up,
-                    breadth.tpex_limit_up,
-                    breadth.tpex_flat,
-                    breadth.tpex_down,
-                    breadth.tpex_limit_down,
-                ),
-            )
-            for index, (market, date, up, limit_up, flat, down, limit_down) in enumerate(rows):
-                y = top + 82 + index * 70
-                canvas.create_text(
-                    left + 24,
-                    y,
-                    text=f"{market}  {self.format_date(date)}",
-                    fill=theme["text"],
-                    anchor="w",
-                    font=("Microsoft JhengHei UI", 11, "bold"),
-                )
-                canvas.create_text(
-                    left + 160,
-                    y,
-                    text=f"上漲 {up:,}（漲停 {limit_up:,}）",
-                    fill=theme["up"],
-                    anchor="w",
-                    font=("Microsoft JhengHei UI", 10, "bold"),
-                )
-                canvas.create_text(
-                    left + 355,
-                    y,
-                    text=f"持平 {flat:,}",
-                    fill=theme["muted"],
-                    anchor="w",
-                    font=("Microsoft JhengHei UI", 10),
-                )
-                canvas.create_text(
-                    left + 455,
-                    y,
-                    text=f"下跌 {down:,}（跌停 {limit_down:,}）",
-                    fill=theme["down"],
-                    anchor="w",
-                    font=("Microsoft JhengHei UI", 10, "bold"),
-                )
-            return
-        totals = breadth.totals
-        limit_up, limit_down = breadth.limit_totals
+        left, right, top, bottom = 42, 18, 50, 55
+        plot_width = width - left - right
+        plot_height = height - top - bottom
+        totals = (up, flat, down)
         labels = ("上漲", "持平", "下跌")
         colors = (theme["up"], theme["muted"], theme["down"])
-        splits = (
-            (breadth.twse_up, breadth.tpex_up),
-            (breadth.twse_flat, breadth.tpex_flat),
-            (breadth.twse_down, breadth.tpex_down),
-        )
-        limit_splits = (
-            (breadth.twse_limit_up, breadth.tpex_limit_up),
-            (0, 0),
-            (breadth.twse_limit_down, breadth.tpex_limit_down),
-        )
-        limit_totals = (limit_up, 0, limit_down)
+        limit_counts = (limit_up, 0, limit_down)
         maximum = max(totals) or 1
         group_width = plot_width / 3
-        bar_width = min(120, group_width * 0.48)
-        for index, (label, total, color, split, limit_total, limit_split) in enumerate(
-            zip(labels, totals, colors, splits, limit_totals, limit_splits)
+        bar_width = min(82, group_width * 0.50)
+        for grid_index in range(4):
+            y = top + plot_height * grid_index / 3
+            canvas.create_line(left, y, width - right, y, fill=theme["grid"])
+        for index, (label, count, color, limit_count) in enumerate(
+            zip(labels, totals, colors, limit_counts)
         ):
             center_x = left + group_width * (index + 0.5)
-            bar_height = plot_height * total / maximum
+            bar_height = plot_height * count / maximum
             y0 = top + plot_height - bar_height
             canvas.create_rectangle(
                 center_x - bar_width / 2,
@@ -4619,35 +5041,169 @@ class MarketOverviewWindow:
             )
             canvas.create_text(
                 center_x,
-                max(top + 12, y0 - 12),
-                text=f"{total:,}",
+                max(top + 10, y0 - 10),
+                text=f"{count:,}",
                 fill=color,
-                font=("Segoe UI", 13, "bold"),
+                font=("Segoe UI", 12, "bold"),
             )
             canvas.create_text(
                 center_x,
-                height - bottom + 20,
-                text=(
-                    f"{label}（{'漲停' if index == 0 else '跌停'} {limit_total:,}）"
-                    if index != 1
-                    else label
-                ),
+                height - bottom + 17,
+                text=label,
                 fill=theme["text"],
-                font=("Microsoft JhengHei UI", 11, "bold"),
+                font=("Microsoft JhengHei UI", 10, "bold"),
+            )
+            detail = (
+                f"漲停 {limit_count:,}"
+                if index == 0
+                else f"跌停 {limit_count:,}"
+                if index == 2
+                else f"占 {count / total * 100:.1f}%"
             )
             canvas.create_text(
                 center_x,
-                height - bottom + 43,
-                text=(
-                    f"上市 {split[0]:,}（{limit_split[0]:,}）｜"
-                    f"上櫃 {split[1]:,}（{limit_split[1]:,}）"
-                    if index != 1
-                    else f"上市 {split[0]:,}｜上櫃 {split[1]:,}"
-                ),
-                fill=theme["muted"],
-                font=("Microsoft JhengHei UI", 9),
+                height - bottom + 37,
+                text=detail,
+                fill=color if index != 1 else theme["muted"],
+                font=("Microsoft JhengHei UI", 8, "bold"),
             )
 
+    def draw_institution_charts(self) -> None:
+        self.draw_institution_flow_chart()
+        self.draw_institution_net_chart()
+
+    def draw_institution_flow_chart(self) -> None:
+        canvas = self.institution_flow_canvas
+        canvas.delete("all")
+        theme = self.theme_getter()
+        width = max(canvas.winfo_width(), 520)
+        height = max(canvas.winfo_height(), 180)
+        canvas.create_rectangle(
+            1, 1, width - 2, height - 2,
+            fill=theme["surface_alt"], outline=theme["line"],
+        )
+        canvas.create_text(
+            14, 16, text="買進／賣出金額", fill=theme["text"], anchor="w",
+            font=("Microsoft JhengHei UI", 11, "bold"),
+        )
+        canvas.create_text(
+            width - 118, 16, text="■ 買進", fill=theme["up"], anchor="w",
+            font=("Microsoft JhengHei UI", 8, "bold"),
+        )
+        canvas.create_text(
+            width - 62, 16, text="■ 賣出", fill=theme["down"], anchor="w",
+            font=("Microsoft JhengHei UI", 8, "bold"),
+        )
+        rows = self.institutions.rows if self.institutions else []
+        if not rows:
+            canvas.create_text(
+                width / 2, height / 2, text="正在載入法人資料...",
+                fill=theme["muted"], font=("Microsoft JhengHei UI", 10),
+            )
+            return
+        values = [
+            amount / 100_000_000
+            for row in rows
+            for amount in (row.buy_amount, row.sell_amount)
+        ]
+        maximum = max(values) or 1
+        left, right, top, bottom = 44, 18, 42, 38
+        plot_height = height - top - bottom
+        group_width = (width - left - right) / len(rows)
+        bar_width = min(34, group_width * 0.25)
+        for grid_index in range(4):
+            y = top + plot_height * grid_index / 3
+            canvas.create_line(left, y, width - right, y, fill=theme["grid"])
+        for index, row in enumerate(rows):
+            center = left + group_width * (index + 0.5)
+            series = (
+                (-bar_width / 2, row.buy_amount / 100_000_000, theme["up"]),
+                (bar_width / 2, row.sell_amount / 100_000_000, theme["down"]),
+            )
+            for offset, value, color in series:
+                bar_height = plot_height * value / maximum
+                x0 = center + offset - bar_width / 2
+                y0 = top + plot_height - bar_height
+                canvas.create_rectangle(
+                    x0, y0, x0 + bar_width, top + plot_height,
+                    fill=color, outline="",
+                )
+                canvas.create_text(
+                    x0 + bar_width / 2,
+                    max(top + 7, y0 - 7),
+                    text=f"{value:,.0f}",
+                    fill=color,
+                    font=("Segoe UI", 7, "bold"),
+                )
+            canvas.create_text(
+                center, height - 18,
+                text=self.short_institution_name(row.name),
+                fill=theme["text"],
+                font=("Microsoft JhengHei UI", 9, "bold"),
+            )
+
+    def draw_institution_net_chart(self) -> None:
+        canvas = self.institution_net_canvas
+        canvas.delete("all")
+        theme = self.theme_getter()
+        width = max(canvas.winfo_width(), 380)
+        height = max(canvas.winfo_height(), 180)
+        canvas.create_rectangle(
+            1, 1, width - 2, height - 2,
+            fill=theme["surface_alt"], outline=theme["line"],
+        )
+        rows = self.institutions.rows if self.institutions else []
+        total_net = sum(row.net_amount for row in rows) / 100_000_000 if rows else 0
+        canvas.create_text(
+            14, 16, text="法人買賣超", fill=theme["text"], anchor="w",
+            font=("Microsoft JhengHei UI", 11, "bold"),
+        )
+        canvas.create_text(
+            width - 14, 16, text=f"合計 {fmt_signed(total_net)} 億",
+            fill=theme["up"] if total_net >= 0 else theme["down"], anchor="e",
+            font=("Microsoft JhengHei UI", 9, "bold"),
+        )
+        if not rows:
+            canvas.create_text(
+                width / 2, height / 2, text="正在載入法人資料...",
+                fill=theme["muted"], font=("Microsoft JhengHei UI", 10),
+            )
+            return
+        left, right, top, bottom = 82, 28, 42, 18
+        center = left + (width - left - right) / 2
+        half_width = (width - left - right) / 2
+        maximum = max(abs(row.net_amount / 100_000_000) for row in rows) or 1
+        row_height = (height - top - bottom) / len(rows)
+        canvas.create_line(
+            center, top - 4, center, height - bottom,
+            fill=theme["line"], width=2,
+        )
+        for index, row in enumerate(rows):
+            value = row.net_amount / 100_000_000
+            y = top + row_height * (index + 0.5)
+            extent = half_width * abs(value) / maximum
+            color = theme["up"] if value >= 0 else theme["down"]
+            x0, x1 = (
+                (center, center + extent)
+                if value >= 0
+                else (center - extent, center)
+            )
+            canvas.create_text(
+                12, y, text=self.short_institution_name(row.name),
+                fill=theme["text"], anchor="w",
+                font=("Microsoft JhengHei UI", 8, "bold"),
+            )
+            canvas.create_rectangle(x0, y - 8, x1, y + 8, fill=color, outline="")
+            label_x = min(width - 8, x1 + 5) if value >= 0 else max(left + 5, x0 - 5)
+            canvas.create_text(
+                label_x, y, text=fmt_signed(value), fill=color,
+                anchor="w" if value >= 0 else "e",
+                font=("Segoe UI", 8, "bold"),
+            )
+
+    def draw_breadth_chart(self) -> None:
+        """Backward-compatible redraw entry point for older callers/tests."""
+        self.draw_breadth_charts()
 
 class EtfDetailWindow:
     def __init__(
