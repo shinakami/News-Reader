@@ -167,10 +167,35 @@ def render_snapshot(snapshot: dict) -> str:
         }
     lines.append("\n【上市上櫃漲跌家數】")
     if breadth:
-        lines.append(
-            f"- 上漲 {breadth['up']:,}、持平 {breadth['flat']:,}、下跌 {breadth['down']:,}；"
-            f"資料日 上市 {breadth['twse_date']}／上櫃 {breadth['tpex_date']}"
-        )
+        if breadth.get("dates_match", True):
+            date_text = (
+                f"上市 {breadth['twse_date']}／上櫃 {breadth['tpex_date']}"
+                if "--" in {breadth["twse_date"], breadth["tpex_date"]}
+                else breadth["twse_date"]
+            )
+            lines.append(
+                f"- 上漲 {breadth['up']:,}（其中漲停 {breadth.get('limit_up', 0):,}）、"
+                f"持平 {breadth['flat']:,}、"
+                f"下跌 {breadth['down']:,}（其中跌停 {breadth.get('limit_down', 0):,}）；"
+                f"資料日 {date_text}"
+            )
+        else:
+            lines.append(
+                f"- 上市：上漲 {breadth.get('twse_up', 0):,}"
+                f"（漲停 {breadth.get('twse_limit_up', 0):,}）、"
+                f"持平 {breadth.get('twse_flat', 0):,}、"
+                f"下跌 {breadth.get('twse_down', 0):,}"
+                f"（跌停 {breadth.get('twse_limit_down', 0):,}）；"
+                f"資料日 {breadth['twse_date']}"
+            )
+            lines.append(
+                f"- 上櫃：上漲 {breadth.get('tpex_up', 0):,}"
+                f"（漲停 {breadth.get('tpex_limit_up', 0):,}）、"
+                f"持平 {breadth.get('tpex_flat', 0):,}、"
+                f"下跌 {breadth.get('tpex_down', 0):,}"
+                f"（跌停 {breadth.get('tpex_limit_down', 0):,}）；"
+                f"資料日 {breadth['tpex_date']}。日期不同，不合併計算。"
+            )
     else:
         lines.append("- 暫無資料")
     lines.append("\n【三大法人（億元）】")
@@ -230,10 +255,18 @@ def build_local_summary(snapshot: dict) -> str:
         lines.append("- 四大指數目前尚無可用行情。")
     breadth = snapshot.get("breadth")
     if breadth:
-        lines.append(
-            f"- 上市＋上櫃：上漲 {breadth['up']:,} 家、持平 {breadth['flat']:,} 家、"
-            f"下跌 {breadth['down']:,} 家。"
-        )
+        if breadth.get("dates_match", True):
+            lines.append(
+                f"- 上市＋上櫃：上漲 {breadth['up']:,} 家"
+                f"（漲停 {breadth.get('limit_up', 0):,} 家）、"
+                f"持平 {breadth['flat']:,} 家、下跌 {breadth['down']:,} 家"
+                f"（跌停 {breadth.get('limit_down', 0):,} 家）。"
+            )
+        else:
+            lines.append(
+                "- 上市與上櫃資料日期不同，本次不合併漲跌及漲跌停家數；"
+                "請以各市場分項資料為準。"
+            )
     institutions = snapshot.get("institutions", [])
     if institutions:
         lines.append(
@@ -253,7 +286,7 @@ def build_local_summary(snapshot: dict) -> str:
         lines.append("- 四大指數漲跌分歧，盤勢較偏輪動，單一指數不宜代表整體市場。")
     else:
         lines.append("- 指數變化不足，暫時無法判斷方向。")
-    if breadth:
+    if breadth and breadth.get("dates_match", True):
         if breadth["up"] > breadth["down"] * 1.25:
             lines.append("- 上漲家數明顯多於下跌家數，市場廣度偏正向。")
         elif breadth["down"] > breadth["up"] * 1.25:

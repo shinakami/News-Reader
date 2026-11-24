@@ -97,6 +97,13 @@ class EtfQuote:
             return self.price
         if self.bid is not None and self.ask is not None:
             return (self.bid + self.ask) / 2
+        # At the daily price limit TWSE may publish only one side of the book
+        # and leave the latest-trade field empty.  That remaining quote is the
+        # best current price; falling back to yesterday's close is misleading.
+        if self.bid is not None:
+            return self.bid
+        if self.ask is not None:
+            return self.ask
         return self.previous_close
 
     @property
@@ -133,7 +140,13 @@ def to_int(value: str | None) -> int | None:
 def first_level(value: str | None) -> float | None:
     if not value:
         return None
-    return to_float(value.split("_", 1)[0])
+    # MIS sometimes prefixes the real order book with a 0.0000 placeholder,
+    # especially when a security is locked at its daily price limit.
+    for level in value.split("_"):
+        price = to_float(level)
+        if price is not None and price > 0:
+            return price
+    return None
 
 
 def signed(value: float | None, digits: int = 2) -> str:

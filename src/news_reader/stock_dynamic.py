@@ -188,6 +188,10 @@ class SecurityQuote:
     market_time: str
     market_timestamp: int | None = None
     source: str = "Yahoo Finance"
+    limit_up_price: float | None = None
+    limit_down_price: float | None = None
+    is_limit_up: bool = False
+    is_limit_down: bool = False
 
     @property
     def change(self) -> float | None:
@@ -200,6 +204,14 @@ class SecurityQuote:
         if self.change is None or not self.previous_close:
             return None
         return self.change / self.previous_close * 100
+
+    @property
+    def limit_status(self) -> str:
+        if self.is_limit_up:
+            return "漲停"
+        if self.is_limit_down:
+            return "跌停"
+        return ""
 
 
 def moving_average(candles: list[MarketCandle], period: int) -> list[float | None]:
@@ -517,6 +529,19 @@ def security_quote_from_yahoo_tw_item(
     meta = chart.get("meta") or {}
     quote = chart.get("quote") or {}
     price = to_float(str(quote.get("price") or ""))
+    limit_up_price = to_float(
+        str(quote.get("limitUpPrice") or meta.get("limitUpPrice") or "")
+    )
+    limit_down_price = to_float(
+        str(quote.get("limitDownPrice") or meta.get("limitDownPrice") or "")
+    )
+    is_limit_up = quote.get("limitUp") is True
+    is_limit_down = quote.get("limitDown") is True
+    if price is None:
+        if is_limit_up:
+            price = limit_up_price
+        elif is_limit_down:
+            price = limit_down_price
     refreshed_text = str(quote.get("refreshedTs") or "")
     timestamp: int | None = None
     if refreshed_text and refreshed_text != "-":
@@ -562,6 +587,10 @@ def security_quote_from_yahoo_tw_item(
         market_time=market_time,
         market_timestamp=timestamp,
         source="Yahoo 股市" if price is not None else "Yahoo 股市（暫無資料）",
+        limit_up_price=limit_up_price,
+        limit_down_price=limit_down_price,
+        is_limit_up=is_limit_up,
+        is_limit_down=is_limit_down,
     )
 
 
@@ -1121,6 +1150,11 @@ def pct_text(latest: float | None, previous_close: float | None) -> str:
     return f"{fmt_signed(change)} ({fmt_signed(pct)}%)"
 
 
+def format_percent_with_limit(value: float | None, limit_status: str = "") -> str:
+    text = f"{fmt_signed(value)}%"
+    return f"{text} {limit_status}" if limit_status else text
+
+
 @dataclass(frozen=True)
 class EtfMarketRow:
     code: str
@@ -1142,6 +1176,10 @@ class EtfMarketRow:
     holders: int | None = None
     value_ytd: float | None = None
     volume_ytd: int | None = None
+    limit_up_price: float | None = None
+    limit_down_price: float | None = None
+    is_limit_up: bool = False
+    is_limit_down: bool = False
 
     @property
     def change(self) -> float | None:
@@ -1154,6 +1192,14 @@ class EtfMarketRow:
         if self.change is None or not self.previous_close:
             return None
         return self.change / self.previous_close * 100
+
+    @property
+    def limit_status(self) -> str:
+        if self.is_limit_up:
+            return "漲停"
+        if self.is_limit_down:
+            return "跌停"
+        return ""
 
 
 def security_quote_to_market_row(
@@ -1173,6 +1219,10 @@ def security_quote_to_market_row(
         transaction=None,
         market_time=quote.market_time,
         source=quote.source,
+        limit_up_price=quote.limit_up_price,
+        limit_down_price=quote.limit_down_price,
+        is_limit_up=quote.is_limit_up,
+        is_limit_down=quote.is_limit_down,
     )
 
 
@@ -1195,11 +1245,15 @@ class MarketBreadth:
     twse_date: str
     tpex_date: str
     twse_up: int
+    twse_limit_up: int
     twse_flat: int
     twse_down: int
+    twse_limit_down: int
     tpex_up: int
+    tpex_limit_up: int
     tpex_flat: int
     tpex_down: int
+    tpex_limit_down: int
 
     @property
     def totals(self) -> tuple[int, int, int]:
@@ -1208,6 +1262,17 @@ class MarketBreadth:
             self.twse_flat + self.tpex_flat,
             self.twse_down + self.tpex_down,
         )
+
+    @property
+    def limit_totals(self) -> tuple[int, int]:
+        return (
+            self.twse_limit_up + self.tpex_limit_up,
+            self.twse_limit_down + self.tpex_limit_down,
+        )
+
+    @property
+    def dates_match(self) -> bool:
+        return bool(self.twse_date and self.twse_date == self.tpex_date)
 
 
 def parse_amount(value: str | int | None) -> int:
@@ -1259,6 +1324,23 @@ def parse_breadth_count(value: str | int | None) -> int:
     return parse_amount(text)
 
 
+def parse_breadth_counts(value: str | int | None) -> tuple[int, int]:
+    """Parse TWSE values such as ``652(43)`` into total and limit count."""
+    if value is None or not str(value).strip():
+        raise RuntimeError("TWSE 漲跌家數欄位為空")
+    text = str(value).strip()
+    match = re.fullmatch(r"([\d,]+)(?:\(([\d,]+)\))?", text)
+    if not match:
+        raise RuntimeError(f"TWSE 漲跌家數格式錯誤：{text!r}")
+    total = parse_amount(match.group(1))
+    limit = parse_amount(match.group(2)) if match.group(2) else 0
+    if limit > total:
+        raise RuntimeError(
+            f"TWSE 漲跌停家數不合理：總數 {total:,}、漲跌停 {limit:,}"
+        )
+    return total, limit
+
+
 def roc_date_to_iso(value: str) -> str:
     if len(value) != 7 or not value.isdigit():
         return value
@@ -1285,15 +1367,54 @@ def fetch_market_breadth(timeout: int, verify_ssl: bool) -> MarketBreadth:
         raise RuntimeError("TWSE 上市漲跌家數格式錯誤")
     twse_rows = {row[0]: row for row in breadth_table.get("data", []) if len(row) >= 3}
     tpex = tpex_payload[0]
+    required_twse_rows = {"上漲(漲停)", "持平", "下跌(跌停)"}
+    missing_twse_rows = required_twse_rows - twse_rows.keys()
+    if missing_twse_rows:
+        raise RuntimeError(
+            "TWSE 漲跌家數缺少欄位：" + "、".join(sorted(missing_twse_rows))
+        )
+    required_tpex_fields = {
+        "Date",
+        "PriceRiseCompanyNumbers",
+        "LimitUpCompanyNumbers",
+        "PriceFlatCompanyNumbers",
+        "PriceDeclineCompanyNumbers",
+        "LimitDownCompanyNumbers",
+    }
+    missing_tpex_fields = {
+        field
+        for field in required_tpex_fields
+        if field not in tpex or not str(tpex.get(field, "")).strip()
+    }
+    if missing_tpex_fields:
+        raise RuntimeError(
+            "TPEx 漲跌家數缺少欄位：" + "、".join(sorted(missing_tpex_fields))
+        )
+    twse_up, twse_limit_up = parse_breadth_counts(
+        twse_rows["上漲(漲停)"][2]
+    )
+    twse_down, twse_limit_down = parse_breadth_counts(
+        twse_rows["下跌(跌停)"][2]
+    )
+    tpex_up = parse_amount(tpex.get("PriceRiseCompanyNumbers"))
+    tpex_limit_up = parse_amount(tpex.get("LimitUpCompanyNumbers"))
+    tpex_down = parse_amount(tpex.get("PriceDeclineCompanyNumbers"))
+    tpex_limit_down = parse_amount(tpex.get("LimitDownCompanyNumbers"))
+    if tpex_limit_up > tpex_up or tpex_limit_down > tpex_down:
+        raise RuntimeError("TPEx 漲跌停家數大於漲跌家數，資料格式可能已變更")
     return MarketBreadth(
         twse_date=twse_payload.get("date", ""),
         tpex_date=roc_date_to_iso(tpex.get("Date", "")),
-        twse_up=parse_breadth_count(twse_rows.get("上漲(漲停)", ["", "", 0])[2]),
-        twse_flat=parse_breadth_count(twse_rows.get("持平", ["", "", 0])[2]),
-        twse_down=parse_breadth_count(twse_rows.get("下跌(跌停)", ["", "", 0])[2]),
-        tpex_up=parse_amount(tpex.get("PriceRiseCompanyNumbers")),
+        twse_up=twse_up,
+        twse_limit_up=twse_limit_up,
+        twse_flat=parse_breadth_count(twse_rows["持平"][2]),
+        twse_down=twse_down,
+        twse_limit_down=twse_limit_down,
+        tpex_up=tpex_up,
+        tpex_limit_up=tpex_limit_up,
         tpex_flat=parse_amount(tpex.get("PriceFlatCompanyNumbers")),
-        tpex_down=parse_amount(tpex.get("PriceDeclineCompanyNumbers")),
+        tpex_down=tpex_down,
+        tpex_limit_down=tpex_limit_down,
     )
 
 
@@ -1367,6 +1488,10 @@ def enrich_etf_row(row: EtfMarketRow, profile: dict[str, str] | None) -> EtfMark
         holders=to_int(profile.get("holders")),
         value_ytd=parse_float_text(profile.get("valueYTD")),
         volume_ytd=to_int(profile.get("volumeYTD")),
+        limit_up_price=row.limit_up_price,
+        limit_down_price=row.limit_down_price,
+        is_limit_up=row.is_limit_up,
+        is_limit_down=row.is_limit_down,
     )
 
 
@@ -1394,9 +1519,26 @@ def row_from_mis(item: dict[str, str], fallback: EtfMarketRow | None = None) -> 
     price = to_float(item.get("z"))
     bid = first_level(item.get("b"))
     ask = first_level(item.get("a"))
-    if price is None and bid is not None and ask is not None:
-        price = (bid + ask) / 2
+    limit_up_price = to_float(item.get("u"))
+    limit_down_price = to_float(item.get("w"))
+    if price is None:
+        if bid is not None and ask is None:
+            price = bid
+        elif ask is not None and bid is None:
+            price = ask
+        elif bid is not None and ask is not None:
+            price = (bid + ask) / 2
     previous_close = to_float(item.get("y"))
+    is_limit_up = (
+        price is not None
+        and limit_up_price is not None
+        and abs(price - limit_up_price) < 1e-9
+    )
+    is_limit_down = (
+        price is not None
+        and limit_down_price is not None
+        and abs(price - limit_down_price) < 1e-9
+    )
     return EtfMarketRow(
         code=item.get("c", fallback.code if fallback else ""),
         name=item.get("n", fallback.name if fallback else ""),
@@ -1410,6 +1552,10 @@ def row_from_mis(item: dict[str, str], fallback: EtfMarketRow | None = None) -> 
         transaction=fallback.transaction if fallback else None,
         market_time=item.get("t") or item.get("%") or (fallback.market_time if fallback else "--"),
         source="TWSE MIS",
+        limit_up_price=limit_up_price,
+        limit_down_price=limit_down_price,
+        is_limit_up=is_limit_up,
+        is_limit_down=is_limit_down,
     )
 
 
@@ -2997,8 +3143,21 @@ class StockDynamicApp:
                 "up": up,
                 "flat": flat,
                 "down": down,
+                "limit_up": breadth.limit_totals[0],
+                "limit_down": breadth.limit_totals[1],
+                "twse_up": breadth.twse_up,
+                "twse_limit_up": breadth.twse_limit_up,
+                "twse_flat": breadth.twse_flat,
+                "twse_down": breadth.twse_down,
+                "twse_limit_down": breadth.twse_limit_down,
+                "tpex_up": breadth.tpex_up,
+                "tpex_limit_up": breadth.tpex_limit_up,
+                "tpex_flat": breadth.tpex_flat,
+                "tpex_down": breadth.tpex_down,
+                "tpex_limit_down": breadth.tpex_limit_down,
                 "twse_date": breadth.twse_date or "--",
                 "tpex_date": breadth.tpex_date or "--",
+                "dates_match": breadth.dates_match,
             }
         return {
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3385,7 +3544,7 @@ class StockDynamicApp:
                     quote.name,
                     fmt_number(quote.price),
                     fmt_signed(quote.change),
-                    f"{fmt_signed(quote.change_percent)}%",
+                    format_percent_with_limit(quote.change_percent, quote.limit_status),
                     fmt_number(quote.volume, 0),
                     quote.market_time,
                 ),
@@ -3545,7 +3704,7 @@ class StockDynamicApp:
                     quote.name,
                     fmt_number(quote.price),
                     fmt_signed(quote.change),
-                    f"{fmt_signed(quote.change_percent)}%",
+                    format_percent_with_limit(quote.change_percent, quote.limit_status),
                     fmt_number(quote.volume, 0),
                     quote.market_time,
                     source,
@@ -3590,7 +3749,7 @@ class StockDynamicApp:
                     fmt_number(etf.market_value, 0),
                     fmt_number(etf.price),
                     fmt_signed(etf.change),
-                    f"{fmt_signed(etf.change_percent)}%",
+                    format_percent_with_limit(etf.change_percent, etf.limit_status),
                     fmt_number(etf.volume, 0),
                     etf.market_time,
                     etf.source,
@@ -4234,7 +4393,7 @@ class MarketOverviewWindow:
         breadth_header.pack(fill="x")
         ttk.Label(
             breadth_header,
-            text="全台上市＋上櫃漲跌家數",
+            text="全台上市＋上櫃漲跌家數（含漲跌停）",
             style="CardTitle.TLabel",
             font=("Microsoft JhengHei UI", 13, "bold"),
         ).pack(side="left")
@@ -4363,7 +4522,71 @@ class MarketOverviewWindow:
             return
 
         breadth = self.breadth
+        if not breadth.dates_match:
+            canvas.create_text(
+                width / 2,
+                top + 22,
+                text="上市與上櫃資料日不同，為避免誤判不合併繪圖",
+                fill=theme["muted"],
+                font=("Microsoft JhengHei UI", 11, "bold"),
+            )
+            rows = (
+                (
+                    "上市",
+                    breadth.twse_date,
+                    breadth.twse_up,
+                    breadth.twse_limit_up,
+                    breadth.twse_flat,
+                    breadth.twse_down,
+                    breadth.twse_limit_down,
+                ),
+                (
+                    "上櫃",
+                    breadth.tpex_date,
+                    breadth.tpex_up,
+                    breadth.tpex_limit_up,
+                    breadth.tpex_flat,
+                    breadth.tpex_down,
+                    breadth.tpex_limit_down,
+                ),
+            )
+            for index, (market, date, up, limit_up, flat, down, limit_down) in enumerate(rows):
+                y = top + 82 + index * 70
+                canvas.create_text(
+                    left + 24,
+                    y,
+                    text=f"{market}  {self.format_date(date)}",
+                    fill=theme["text"],
+                    anchor="w",
+                    font=("Microsoft JhengHei UI", 11, "bold"),
+                )
+                canvas.create_text(
+                    left + 160,
+                    y,
+                    text=f"上漲 {up:,}（漲停 {limit_up:,}）",
+                    fill=theme["up"],
+                    anchor="w",
+                    font=("Microsoft JhengHei UI", 10, "bold"),
+                )
+                canvas.create_text(
+                    left + 355,
+                    y,
+                    text=f"持平 {flat:,}",
+                    fill=theme["muted"],
+                    anchor="w",
+                    font=("Microsoft JhengHei UI", 10),
+                )
+                canvas.create_text(
+                    left + 455,
+                    y,
+                    text=f"下跌 {down:,}（跌停 {limit_down:,}）",
+                    fill=theme["down"],
+                    anchor="w",
+                    font=("Microsoft JhengHei UI", 10, "bold"),
+                )
+            return
         totals = breadth.totals
+        limit_up, limit_down = breadth.limit_totals
         labels = ("上漲", "持平", "下跌")
         colors = (theme["up"], theme["muted"], theme["down"])
         splits = (
@@ -4371,10 +4594,18 @@ class MarketOverviewWindow:
             (breadth.twse_flat, breadth.tpex_flat),
             (breadth.twse_down, breadth.tpex_down),
         )
+        limit_splits = (
+            (breadth.twse_limit_up, breadth.tpex_limit_up),
+            (0, 0),
+            (breadth.twse_limit_down, breadth.tpex_limit_down),
+        )
+        limit_totals = (limit_up, 0, limit_down)
         maximum = max(totals) or 1
         group_width = plot_width / 3
         bar_width = min(120, group_width * 0.48)
-        for index, (label, total, color, split) in enumerate(zip(labels, totals, colors, splits)):
+        for index, (label, total, color, split, limit_total, limit_split) in enumerate(
+            zip(labels, totals, colors, splits, limit_totals, limit_splits)
+        ):
             center_x = left + group_width * (index + 0.5)
             bar_height = plot_height * total / maximum
             y0 = top + plot_height - bar_height
@@ -4396,14 +4627,23 @@ class MarketOverviewWindow:
             canvas.create_text(
                 center_x,
                 height - bottom + 20,
-                text=label,
+                text=(
+                    f"{label}（{'漲停' if index == 0 else '跌停'} {limit_total:,}）"
+                    if index != 1
+                    else label
+                ),
                 fill=theme["text"],
                 font=("Microsoft JhengHei UI", 11, "bold"),
             )
             canvas.create_text(
                 center_x,
                 height - bottom + 43,
-                text=f"上市 {split[0]:,}｜上櫃 {split[1]:,}",
+                text=(
+                    f"上市 {split[0]:,}（{limit_split[0]:,}）｜"
+                    f"上櫃 {split[1]:,}（{limit_split[1]:,}）"
+                    if index != 1
+                    else f"上市 {split[0]:,}｜上櫃 {split[1]:,}"
+                ),
                 fill=theme["muted"],
                 font=("Microsoft JhengHei UI", 9),
             )
@@ -4623,7 +4863,10 @@ class EtfDetailWindow:
 
         self.title_text.set(f"{quote.code}  {quote.name}")
         self.price_text.set(fmt_number(quote.price))
-        self.change_text.set(f"{fmt_signed(quote.change)} / {fmt_signed(quote.change_percent)}%")
+        self.change_text.set(
+            f"{fmt_signed(quote.change)} / "
+            f"{format_percent_with_limit(quote.change_percent, quote.limit_status)}"
+        )
         self.change_label.configure(fg=theme["up"] if (quote.change or 0) >= 0 else theme["down"])
         self.source_text.set(
             f"來源：{quote.source}｜時間：{quote.market_time}｜{self.candle_grain}"
