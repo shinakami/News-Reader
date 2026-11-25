@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import io
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
@@ -15,6 +17,9 @@ from news_reader.cli_types import positive_int
 from news_reader.market_ai import render_snapshot
 from news_reader.news import parse_args as parse_news_args
 from news_reader.stock_dynamic import (
+    advance_share,
+    fetch_vix_close,
+    vix_intraday,
     parse_args as parse_dynamic_args,
     row_from_mis,
     security_quote_from_yahoo_tw_item,
@@ -22,6 +27,28 @@ from news_reader.stock_dynamic import (
 from news_reader.stock_market_dashboard import main as dashboard_main
 from news_reader.stock_market_dashboard import parse_args as parse_dashboard_args
 from news_reader.stock_monitor import EtfQuote, first_level, parse_args as parse_stock_args
+
+
+class MarketIndicatorTests(unittest.TestCase):
+    def test_vix_requires_active_provider_session_and_fresh_quote(self) -> None:
+        now = datetime(2026, 11, 25, 15, tzinfo=timezone.utc)
+        t = int(now.timestamp())
+        meta = {"symbol": "^VIX", "regularMarketTime": t - 600, "regularMarketPrice": 21.5,
+                "currentTradingPeriod": {"regular": {"start": t - 3600, "end": t + 900}}}
+        self.assertIn("21.50 點｜盤中", vix_intraday(meta, now))
+        self.assertEqual(vix_intraday(dict(meta, regularMarketTime=t - 2000), now), "")
+        meta["currentTradingPeriod"]["regular"]["end"] = t
+        self.assertEqual(vix_intraday(meta, now), "")
+
+    def test_advance_share(self) -> None:
+        self.assertEqual(advance_share(3, 2, 1), "50.0%")
+        self.assertEqual(advance_share(0, 1, 2), "0.0%")
+        self.assertEqual(advance_share(0, 0, 0), "--")
+
+    def test_vix_uses_latest_source_close_and_trade_date(self) -> None:
+        data = b"DATE,OPEN,HIGH,LOW,CLOSE\n11/20/2026,20,21,18,19\n11/23/2026,19,20,16,17.25\n"
+        with patch("urllib.request.urlopen", return_value=io.BytesIO(data)):
+            self.assertEqual(fetch_vix_close(5, True), "17.25 點｜收盤資料 2026-11-23（美東交易日）")
 
 
 class PositiveIntegerTests(unittest.TestCase):

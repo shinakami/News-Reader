@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+from http.client import HTTPException
 import io
 import json
+import math
 import queue
 import re
 import sys
@@ -137,13 +139,13 @@ ETF_BATCH_SIZE = 45
 THEMES = {
     "night": {
         "label": "深夜",
-        "bg": "#111827",
-        "surface": "#1f2937",
-        "surface_alt": "#111827",
-        "text": "#f8fafc",
-        "muted": "#a6b0c3",
-        "line": "#334155",
-        "grid": "#2b3545",
+        "bg": "#0b111b",
+        "surface": "#172333",
+        "surface_alt": "#101a28",
+        "text": "#eff4fa",
+        "muted": "#abbccd",
+        "line": "#34475c",
+        "grid": "#26374a",
         "up": "#f87171",
         "down": "#34d399",
         "up_fill": "#3f1f26",
@@ -152,7 +154,7 @@ THEMES = {
         "ma5": "#38bdf8",
         "ma10": "#a78bfa",
         "ma20": "#fb923c",
-        "selected": "#334155",
+        "selected": "#284767",
     },
 }
 
@@ -163,6 +165,28 @@ DASHBOARD_BACKGROUND_MODES = {
     "並排": "tile",
     "置中": "center",
 }
+
+
+def movement_tag(change: float | None) -> str:
+    if not change:
+        return "neutral"
+    return "up" if change > 0 else "down"
+
+
+def update_quote_row(tree, key, values, tag):
+    # Keep the existing row identity so polling does not remove keyboard focus
+    # or the selection just before the user opens a detail chart.
+    if tree.exists(key):
+        tree.item(key, values=values, tags=(tag,))
+    else:
+        tree.insert("", "end", iid=key, values=values, tags=(tag,))
+
+
+def trim_quote_rows(tree, keys):
+    keep = set(keys)
+    for key in tree.get_children():
+        if key not in keep:
+            tree.delete(key)
 
 
 @dataclass(frozen=True)
@@ -1254,6 +1278,9 @@ class MarketBreadth:
     tpex_flat: int
     tpex_down: int
     tpex_limit_down: int
+    source_label: str = "收盤資料"
+    twse_clock: str = ""
+    tpex_clock: str = ""
 
     @property
     def totals(self) -> tuple[int, int, int]:
@@ -1289,6 +1316,41 @@ def fetch_json(url: str, timeout: int, verify_ssl: bool) -> object:
         context=make_context(verify_ssl),
     ) as response:
         return json.loads(response.read().decode("utf-8-sig"))
+
+
+def vix_intraday(meta: dict, now: datetime) -> str:
+    session = meta["currentTradingPeriod"]["regular"]
+    stamp = meta["regularMarketTime"]
+    if not (meta["symbol"] == "^VIX" and session["start"] <= stamp <= now.timestamp() < session["end"]
+            and now.timestamp() - stamp <= 1800):
+        return ""
+    price = float(meta["regularMarketPrice"])
+    if not math.isfinite(price) or price <= 0:
+        return ""
+    local = datetime.fromtimestamp(stamp, us_eastern_timezone(now))
+    return f"Yahoo｜{price:.2f} 點｜盤中（可能延遲）{local:%m-%d %H:%M:%S} 美東"
+
+
+def fetch_vix_close(timeout: int, verify_ssl: bool) -> str:
+    url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request, timeout=timeout, context=make_context(verify_ssl)) as response:
+        rows = csv.DictReader(io.StringIO(response.read().decode("utf-8-sig")))
+        last = None
+        for row in rows:
+            last = row
+    if not last:
+        raise ValueError("Cboe 未回傳資料")
+    day = datetime.strptime(last.get("DATE") or "", "%m/%d/%Y").date()
+    close = float(last.get("CLOSE") or "")
+    if not math.isfinite(close) or close <= 0:
+        raise ValueError("VIX 收盤值無效")
+    return f"{close:.2f} 點｜收盤資料 {day}（美東交易日）"
+
+
+def advance_share(up: int, flat: int, down: int) -> str:
+    total = up + flat + down
+    return f"{up / total:.1%}" if total else "--"
 
 
 def fetch_institution_trades(timeout: int, verify_ssl: bool) -> InstitutionSnapshot:
@@ -1345,6 +1407,43 @@ def roc_date_to_iso(value: str) -> str:
     if len(value) != 7 or not value.isdigit():
         return value
     return f"{int(value[:3]) + 1911:04d}{value[3:]}"
+
+
+def yahoo_index_breadth(symbol: str, timeout: int, verify_ssl: bool):
+    url = "https://tw.stock.yahoo.com/quote/" + urllib.parse.quote(symbol, safe="")
+    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Cache-Control": "no-cache"})
+    with urllib.request.urlopen(request, timeout=timeout, context=make_context(verify_ssl)) as response:
+        page = response.read().decode("utf-8")
+    marker = re.search(r'"quote"\s*:\s*\{\s*"data"\s*:\s*(?=\{"ask")', page)
+    if not marker:
+        raise ValueError("缺少市場行情")
+    quote, _ = json.JSONDecoder().raw_decode(page, marker.end())
+    now = datetime.now(timezone(timedelta(hours=8)))
+    stamp = datetime.fromisoformat(quote["regularMarketTime"].replace("Z", "+00:00")).astimezone(now.tzinfo)
+    if (quote["symbol"] != symbol or quote["marketStatus"] != "open"
+            or stamp.date() != now.date() or not 0 <= (now - stamp).total_seconds() <= 300):
+        raise ValueError("非當前盤中行情")
+    counts = [int(quote["indexMeta"][key]["raw"]) for key in
+              ("upCount", "limitUpCount", "unchangeCount", "downCount", "limitDownCount")]
+    up, lu, flat, down, ld = counts
+    if min(counts) < 0 or lu > up or ld > down or not up + flat + down:
+        raise ValueError("市場統計不完整")
+    return stamp, counts
+
+
+def fetch_dashboard_breadth(timeout: int, verify_ssl: bool) -> MarketBreadth:
+    now = datetime.now(timezone(timedelta(hours=8)))
+    if now.weekday() < 5 and clock_time(9) <= now.time() < clock_time(13, 30):
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                listed, otc = list(pool.map(lambda s: yahoo_index_breadth(s, timeout, verify_ssl),
+                                            ("^TWII", "^TWOII")))
+            return MarketBreadth(listed[0].strftime("%Y%m%d"), otc[0].strftime("%Y%m%d"),
+                                 *listed[1], *otc[1], "Yahoo 盤中",
+                                 listed[0].strftime("%H:%M:%S"), otc[0].strftime("%H:%M:%S"))
+        except (ValueError, KeyError, TypeError, OSError, HTTPException):
+            pass  # A missing or stale snapshot must not be presented as a live count.
+    return fetch_market_breadth(timeout, verify_ssl)
 
 
 def fetch_market_breadth(timeout: int, verify_ssl: bool) -> MarketBreadth:
@@ -1686,7 +1785,7 @@ class StockDynamicApp:
         self.theme_name = "night"
         self.theme = THEMES[self.theme_name]
 
-        self.root.title("Stock Dynamic")
+        self.root.title("股票動態儀表板")
         self.root.geometry("1240x840")
         self.root.minsize(680, 520)
         self.root.configure(bg=self.theme["bg"])
@@ -1695,10 +1794,11 @@ class StockDynamicApp:
         self.status_text = tk.StringVar(value="正在載入行情...")
         self.source_text = tk.StringVar(value=f"來源：{source}")
         self.subtitle_text = tk.StringVar(value="台股四大指數、ETF 與個股即時看板")
+        self.page_title = tk.StringVar(value="台股行情")
         self.market_page_button_text = tk.StringVar(value="切換美股")
         self.style = ttk.Style()
         self.card_widgets: list[ttk.Frame] = []
-        self.current_layout: tuple[int, bool, bool, bool] | None = None
+        self.current_layout: tuple[int, bool, bool, bool, int] | None = None
         self.build_ui()
         self.register_global_background(self.root)
         self.apply_theme()
@@ -1713,14 +1813,14 @@ class StockDynamicApp:
 
         header = ttk.Frame(self.root, style="TFrame")
         header.pack(fill="x")
-        self.header_inner = ttk.Frame(header, style="Header.TFrame", padding=(22, 16))
+        self.header_inner = ttk.Frame(header, style="Header.TFrame", padding=(18, 12))
         self.header_inner.pack(fill="x", padx=16, pady=(16, 10))
 
         title = ttk.Label(
             self.header_inner,
-            text="Stock Dynamic",
+            textvariable=self.page_title,
             style="Header.TLabel",
-            font=("Segoe UI", 22, "bold"),
+            font=("Microsoft JhengHei UI", 20, "bold"),
         )
         title.grid(row=0, column=0, sticky="w")
         subtitle = ttk.Label(
@@ -1762,7 +1862,7 @@ class StockDynamicApp:
             ttk.Button(
                 self.header_actions,
                 textvariable=self.market_page_button_text,
-                style="Flat.TButton",
+                style="Market.Flat.TButton",
                 command=self.switch_market_page,
             ),
             ttk.Button(
@@ -1968,6 +2068,7 @@ class StockDynamicApp:
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
         self.etf_tree.bind("<Double-1>", self.open_selected_etf)
+        self.etf_tree.bind("<Return>", self.open_selected_etf)
 
         self.tw_stock_panel = ttk.Frame(
             self.taiwan_tables_pane,
@@ -1983,25 +2084,28 @@ class StockDynamicApp:
             font=("Microsoft JhengHei UI", 13, "bold"),
         ).pack(side="left")
         self.tw_stock_text = tk.StringVar()
-        ttk.Entry(
+        tw_entry = ttk.Entry(
             tw_stock_header,
             textvariable=self.tw_stock_text,
             width=10,
-        ).pack(side="right", padx=(6, 0))
+        )
+        tw_entry.bind("<Return>", lambda _: self.add_taiwan_stock_symbol())
         ttk.Button(
             tw_stock_header,
             text="加入代號",
             style="Flat.TButton",
             command=self.add_taiwan_stock_symbol,
         ).pack(side="right")
+        tw_entry.pack(side="right", padx=(6, 6))
         ttk.Label(
             self.tw_stock_panel,
-            text="預載大型個股；可輸入上市或上櫃代號，雙擊開啟 K 線",
+            text="輸入代號按 Enter 加入；選取個股後按 Enter 或雙擊查看 K 線",
             style="Muted.TLabel",
             font=("Microsoft JhengHei UI", 8),
         ).pack(anchor="w", pady=(2, 6))
         self.tw_stock_tree = self.create_taiwan_stock_tree(self.tw_stock_panel)
         self.tw_stock_tree.bind("<Double-1>", self.open_selected_taiwan_stock)
+        self.tw_stock_tree.bind("<Return>", self.open_selected_taiwan_stock)
 
         self.taiwan_tables_pane.add(
             self.etf_panel,
@@ -2205,6 +2309,12 @@ class StockDynamicApp:
             style="Muted.TLabel",
             font=("Microsoft JhengHei UI", 9),
         ).pack(anchor="w", pady=(2, 6))
+        self.vix_text = tk.StringVar(value="VIX 波動率指數｜等待行情")
+        self.vix_next_fetch = 0.0
+        self.vix_last_close = ""
+        self.vix_close_expiry = 0.0
+        ttk.Label(self.us_chart_panel, textvariable=self.vix_text,
+                  style="CardTitle.TLabel").pack(anchor="w", pady=(0, 4))
         self.us_chart_grid = ttk.Frame(self.us_chart_panel, style="Card.TFrame")
         self.us_chart_grid.pack(fill="both", expand=True)
         self.us_chart_canvases: dict[str, tk.Canvas] = {}
@@ -2273,17 +2383,19 @@ class StockDynamicApp:
             font=("Microsoft JhengHei UI", 12, "bold"),
         ).pack(side="left")
         self.us_symbol_text = tk.StringVar()
-        ttk.Entry(
+        us_entry = ttk.Entry(
             stock_header,
             textvariable=self.us_symbol_text,
             width=12,
-        ).pack(side="right", padx=(6, 0))
+        )
+        us_entry.bind("<Return>", lambda _: self.add_us_stock_symbol())
         ttk.Button(
             stock_header,
             text="加入代號",
             style="Flat.TButton",
             command=self.add_us_stock_symbol,
         ).pack(side="right")
+        us_entry.pack(side="right", padx=(6, 6))
         ttk.Label(
             stocks_panel,
             text="預載大型個股；可加入任一 Yahoo 美股代號，例如 PLTR、BRK-B",
@@ -2387,7 +2499,8 @@ class StockDynamicApp:
         stacked_body = width < 900
         compact_charts = width < 760
         stacked_header = width < 1120
-        layout_key = (card_columns, stacked_body, compact_charts, stacked_header)
+        action_columns = 3 if width < 840 else 6
+        layout_key = (card_columns, stacked_body, compact_charts, stacked_header, action_columns)
         if self.current_layout == layout_key and not force:
             return
         self.current_layout = layout_key
@@ -2420,7 +2533,6 @@ class StockDynamicApp:
         else:
             self.source_label.grid(row=2, column=1, sticky="e", pady=(8, 0))
             self.header_actions.grid(row=0, column=1, sticky="e")
-        action_columns = 3 if stacked_header else 6
         for row in range(2):
             self.header_actions.rowconfigure(row, weight=0)
         for column in range(6):
@@ -2922,6 +3034,24 @@ class StockDynamicApp:
         self.style.configure("CardValue.TLabel", background=theme["surface"], foreground=theme["text"])
         self.style.configure("Up.TLabel", background=theme["surface"], foreground=theme["up"])
         self.style.configure("Down.TLabel", background=theme["surface"], foreground=theme["down"])
+        self.style.configure("Neutral.TLabel", background=theme["surface"], foreground=theme["muted"])
+        # clam's default bevels, scrollbars and white inputs otherwise stay light
+        # even when their containing dashboard and detached windows are dark.
+        self.style.configure("TButton", font=("Microsoft JhengHei UI", 9),
+                             background=theme["surface_alt"], foreground=theme["text"],
+                             bordercolor=theme["line"], lightcolor=theme["line"],
+                             darkcolor=theme["line"], focuscolor=theme["accent"], relief="flat")
+        self.style.map("TButton", background=[("pressed", theme["line"]), ("active", theme["selected"])],
+                       bordercolor=[("focus", theme["accent"])], foreground=[("disabled", theme["muted"])])
+        self.style.configure("Market.Flat.TButton", background=theme["selected"],
+                             foreground=theme["text"], font=("Microsoft JhengHei UI", 9, "bold"))
+        self.style.configure("TEntry", fieldbackground=theme["surface_alt"], foreground=theme["text"],
+                             insertcolor=theme["text"], bordercolor=theme["line"], padding=(6, 4))
+        self.style.map("TEntry", bordercolor=[("focus", theme["accent"])])
+        self.style.configure("TScrollbar", background=theme["line"], troughcolor=theme["surface_alt"],
+                             bordercolor=theme["surface_alt"], arrowcolor=theme["muted"],
+                             lightcolor=theme["line"], darkcolor=theme["line"])
+        self.style.map("TScrollbar", background=[("active", theme["selected"])])
         self.style.configure(
             "Treeview",
             rowheight=32,
@@ -2932,6 +3062,8 @@ class StockDynamicApp:
         )
         self.style.configure(
             "Treeview.Heading",
+            relief="flat", padding=(4, 5), bordercolor=theme["line"],
+            lightcolor=theme["surface_alt"], darkcolor=theme["line"],
             background=theme["surface_alt"],
             foreground=theme["muted"],
             font=("Microsoft JhengHei UI", 9, "bold"),
@@ -2941,6 +3073,7 @@ class StockDynamicApp:
             background=[("selected", theme["selected"])],
             foreground=[("selected", theme["text"])],
         )
+        self.style.map("Treeview.Heading", background=[("active", theme["selected"])])
 
         for pane in [
             self.main_pane,
@@ -2972,6 +3105,7 @@ class StockDynamicApp:
 
     def switch_market_page(self) -> None:
         self.active_page = "us" if self.active_page == "taiwan" else "taiwan"
+        self.page_title.set("美股行情" if self.active_page == "us" else "台股行情")
         if self.active_page == "us":
             self.us_page.tkraise()
             self.us_scroll_canvas.yview_moveto(0)
@@ -3416,6 +3550,9 @@ class StockDynamicApp:
         self.loading = True
         self.loading_page = self.active_page
         self.status_text.set("正在更新行情...")
+        if self.active_page == "us" and time.monotonic() >= self.vix_next_fetch:
+            self.vix_next_fetch = float("inf")
+            threading.Thread(target=self.fetch_vix_worker, daemon=True).start()
         target = self.fetch_us_worker if self.active_page == "us" else self.fetch_worker
         worker = threading.Thread(target=target, daemon=True)
         worker.start()
@@ -3490,6 +3627,23 @@ class StockDynamicApp:
             )
         except Exception as exc:
             self.result_queue.put(("error", exc))
+
+    def fetch_vix_worker(self) -> None:
+        try:
+            url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1m&range=1d"
+            data = fetch_json(url, self.timeout, self.verify_ssl)
+            result = vix_intraday(data["chart"]["result"][0]["meta"], datetime.now(timezone.utc))
+        except (OSError, ValueError, KeyError, TypeError, IndexError, HTTPException):
+            result = ""
+        if not result:
+            try:
+                if time.monotonic() >= self.vix_close_expiry:
+                    self.vix_last_close = "Cboe｜" + fetch_vix_close(self.timeout, self.verify_ssl)
+                    self.vix_close_expiry = time.monotonic() + 300
+                result = self.vix_last_close
+            except (OSError, ValueError, csv.Error, EOFError, HTTPException):
+                result = (self.vix_last_close or "暫無資料") + "（更新失敗）"
+        self.result_queue.put(("vix_close", result))
 
     def fetch_us_worker(self) -> None:
         try:
@@ -3575,6 +3729,10 @@ class StockDynamicApp:
         try:
             while True:
                 kind, payload = self.result_queue.get_nowait()
+                if kind == "vix_close":
+                    self.vix_next_fetch = time.monotonic() + 15
+                    self.vix_text.set(f"VIX 波動率指數｜{payload}")
+                    continue
                 completed_page = self.loading_page
                 self.loading = False
                 self.loading_page = ""
@@ -3645,7 +3803,7 @@ class StockDynamicApp:
             if not labels:
                 continue
             labels["value"].configure(text=fmt_number(quote.price))
-            change_style = "Up.TLabel" if (quote.change or 0) >= 0 else "Down.TLabel"
+            change_style = movement_tag(quote.change).title() + ".TLabel"
             labels["change"].configure(
                 text=f"{fmt_signed(quote.change)} / {fmt_signed(quote.change_percent)}%",
                 style=change_style,
@@ -3697,11 +3855,7 @@ class StockDynamicApp:
                     f"{fmt_signed(quote.change)} / "
                     f"{fmt_signed(quote.change_percent)}%"
                 ),
-                style=(
-                    "Up.TLabel"
-                    if (quote.change or 0) >= 0
-                    else "Down.TLabel"
-                ),
+                style=movement_tag(quote.change).title() + ".TLabel",
             )
             labels["time"].configure(text=f"時間 {quote.market_time}")
 
@@ -3721,16 +3875,10 @@ class StockDynamicApp:
         tree: ttk.Treeview,
         quotes: list[SecurityQuote],
     ) -> None:
-        for item in tree.get_children():
-            tree.delete(item)
+        trim_quote_rows(tree, (quote.symbol for quote in quotes))
         for quote in quotes:
-            tag = ""
-            if quote.change is not None:
-                tag = "up" if quote.change >= 0 else "down"
-            tree.insert(
-                "",
-                "end",
-                iid=quote.symbol,
+            update_quote_row(
+                tree, quote.symbol,
                 values=(
                     quote.symbol,
                     quote.name,
@@ -3740,7 +3888,7 @@ class StockDynamicApp:
                     fmt_number(quote.volume, 0),
                     quote.market_time,
                 ),
-                tags=(tag,) if tag else (),
+                tag=movement_tag(quote.change),
             )
 
     def update_us_live_candle(
@@ -3870,8 +4018,7 @@ class StockDynamicApp:
         self,
         stocks: dict[str, SecurityQuote],
     ) -> None:
-        for item in self.tw_stock_tree.get_children():
-            self.tw_stock_tree.delete(item)
+        trim_quote_rows(self.tw_stock_tree, stocks.keys() & self.tw_stock_symbols.keys())
         self.tw_stock_rows = dict(stocks)
         for code in self.tw_stock_symbols:
             quote = stocks.get(code)
@@ -3879,18 +4026,13 @@ class StockDynamicApp:
                 continue
             if self.tw_stock_symbols[code] == code and quote.name != code:
                 self.tw_stock_symbols[code] = quote.name
-            tag = ""
-            if quote.change is not None:
-                tag = "up" if quote.change >= 0 else "down"
             source = (
                 quote.source
                 if quote.price is not None
                 else "Yahoo 股市（暫無資料）"
             )
-            self.tw_stock_tree.insert(
-                "",
-                "end",
-                iid=code,
+            update_quote_row(
+                self.tw_stock_tree, code,
                 values=(
                     code,
                     quote.name,
@@ -3901,7 +4043,7 @@ class StockDynamicApp:
                     quote.market_time,
                     source,
                 ),
-                tags=(tag,) if tag else (),
+                tag=movement_tag(quote.change),
             )
 
     def open_selected_taiwan_stock(self, _event: tk.Event) -> None:
@@ -3923,18 +4065,14 @@ class StockDynamicApp:
         )
 
     def update_etfs(self, etfs: list[EtfMarketRow] | None) -> None:
-        for item in self.etf_tree.get_children():
-            self.etf_tree.delete(item)
+        trim_quote_rows(self.etf_tree, (etf.code for etf in etfs or []))
         self.etf_rows.clear()
         if not etfs:
             return
-        for etf in etfs:
+        for position, etf in enumerate(etfs):
             self.etf_rows[etf.code] = etf
-            tag = "up" if (etf.change or 0) >= 0 else "down"
-            self.etf_tree.insert(
-                "",
-                "end",
-                iid=etf.code,
+            update_quote_row(
+                self.etf_tree, etf.code,
                 values=(
                     etf.code,
                     etf.name,
@@ -3946,8 +4084,10 @@ class StockDynamicApp:
                     etf.market_time,
                     etf.source,
                 ),
-                tags=(tag,),
+                tag=movement_tag(etf.change),
             )
+            if self.etf_tree.index(etf.code) != position:
+                self.etf_tree.move(etf.code, "", position)
 
     def open_selected_etf(self, _event: tk.Event) -> None:
         selection = self.etf_tree.selection()
@@ -4575,8 +4715,8 @@ class MarketOverviewWindow:
         self.kpi_frame.pack(fill="x", pady=(0, 10))
         self.kpi_cards: list[ttk.Frame] = []
         kpis = (
-            ("上市上漲", self.twse_up_text, "含上市漲停"),
-            ("上櫃上漲", self.tpex_up_text, "含上櫃漲停"),
+            ("上市上漲占比", self.twse_up_text, "上漲 ÷（漲＋平＋跌）"),
+            ("上櫃上漲占比", self.tpex_up_text, "上漲 ÷（漲＋平＋跌）"),
             ("漲停家數", self.limit_up_text, "上市＋上櫃"),
             ("跌停家數", self.limit_down_text, "上市＋上櫃"),
             ("法人合計", self.institution_net_text, "買賣超（億元）"),
@@ -4859,8 +4999,11 @@ class MarketOverviewWindow:
 
     def fetch_worker(self) -> None:
         try:
-            institutions = fetch_institution_trades(self.timeout, self.verify_ssl)
-            breadth = fetch_market_breadth(self.timeout, self.verify_ssl)
+            breadth = fetch_dashboard_breadth(self.timeout, self.verify_ssl)
+            try:
+                institutions = fetch_institution_trades(self.timeout, self.verify_ssl)
+            except (RuntimeError, OSError, ValueError, HTTPException):
+                institutions = None
             self.queue.put(("data", (institutions, breadth)))
         except Exception as exc:
             self.queue.put(("error", exc))
@@ -4875,6 +5018,7 @@ class MarketOverviewWindow:
                     self.update_data(institutions, breadth)
                 else:
                     self.status_text.set(f"更新失敗：{payload}")
+                    self.window.after(self.refresh_interval * 1000, self.refresh)
         except queue.Empty:
             pass
         if not self.closed:
@@ -4886,14 +5030,16 @@ class MarketOverviewWindow:
 
     def update_data(
         self,
-        institutions: InstitutionSnapshot,
+        institutions: InstitutionSnapshot | None,
         breadth: MarketBreadth,
     ) -> None:
         self.status_text.set(
             f"本機更新：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}｜每 {self.refresh_interval} 秒更新"
         )
+        institution_note = "" if institutions else "｜法人更新失敗"
+        institutions = institutions or self.institutions or InstitutionSnapshot("", [])
         self.institution_date_text.set(
-            f"最新公布：{self.format_date(institutions.market_date)}｜單位：億元"
+            f"收盤資料：{self.format_date(institutions.market_date)}｜單位：億元{institution_note}"
         )
         self.institutions = institutions
         for item in self.institution_tree.get_children():
@@ -4913,8 +5059,8 @@ class MarketOverviewWindow:
             )
 
         self.breadth = breadth
-        self.twse_up_text.set(f"{breadth.twse_up:,}")
-        self.tpex_up_text.set(f"{breadth.tpex_up:,}")
+        self.twse_up_text.set(advance_share(breadth.twse_up, breadth.twse_flat, breadth.twse_down))
+        self.tpex_up_text.set(advance_share(breadth.tpex_up, breadth.tpex_flat, breadth.tpex_down))
         if breadth.dates_match:
             self.limit_up_text.set(f"{breadth.limit_totals[0]:,}")
             self.limit_down_text.set(f"{breadth.limit_totals[1]:,}")
@@ -4926,13 +5072,14 @@ class MarketOverviewWindow:
                 f"{breadth.twse_limit_down:,} / {breadth.tpex_limit_down:,}"
             )
         institution_net = sum(row.net_amount for row in institutions.rows) / 100_000_000
-        self.institution_net_text.set(fmt_signed(institution_net))
+        self.institution_net_text.set(fmt_signed(institution_net) if institutions.rows else "--")
         twse_date = self.format_date(breadth.twse_date)
         tpex_date = self.format_date(breadth.tpex_date)
         if twse_date == tpex_date:
-            self.breadth_date_text.set(f"資料日：{twse_date}")
+            self.breadth_date_text.set(f"{breadth.source_label}：{twse_date}" + (
+                "｜盤中採 Yahoo 漲跌統計，涵蓋標的可能與官方收盤家數不同" if breadth.twse_clock else ""))
         else:
-            self.breadth_date_text.set(f"上市：{twse_date}｜上櫃：{tpex_date}")
+            self.breadth_date_text.set(f"收盤資料｜上市：{twse_date}｜上櫃：{tpex_date}")
         self.apply_theme()
         self.window.after(self.refresh_interval * 1000, self.refresh)
 
@@ -5007,7 +5154,9 @@ class MarketOverviewWindow:
         canvas.create_text(
             width - 14,
             16,
-            text=f"資料日 {self.format_date(market_date)}",
+            text=(f"{self.breadth.source_label} {self.format_date(market_date)} "
+                  f"{self.breadth.twse_clock if market == '上市' else self.breadth.tpex_clock}"
+                  if self.breadth and market_date else "等待資料"),
             fill=theme["muted"],
             anchor="e",
             font=("Microsoft JhengHei UI", 8),
@@ -5434,7 +5583,7 @@ class EtfDetailWindow:
             f"{fmt_signed(quote.change)} / "
             f"{format_percent_with_limit(quote.change_percent, quote.limit_status)}"
         )
-        self.change_label.configure(fg=theme["up"] if (quote.change or 0) >= 0 else theme["down"])
+        self.change_label.configure(fg=theme.get(movement_tag(quote.change), theme["muted"]))
         self.source_text.set(
             f"來源：{quote.source}｜時間：{quote.market_time}｜{self.candle_grain}"
         )
