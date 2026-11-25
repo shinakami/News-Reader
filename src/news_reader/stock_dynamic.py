@@ -1834,7 +1834,7 @@ class StockDynamicApp:
 
         self.body = ttk.Frame(self.taiwan_content, style="TFrame", height=520)
         self.body.pack(fill="both", expand=True, padx=16, pady=(4, 16))
-        self.body.pack_propagate(False)
+        self.body.grid_propagate(False)
         self.body.columnconfigure(0, weight=3)
         self.body.columnconfigure(1, weight=2)
         self.body.rowconfigure(0, weight=1)
@@ -2030,7 +2030,7 @@ class StockDynamicApp:
         scrollbar.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
         content = ttk.Frame(canvas, style="TFrame")
-        window_item = canvas.create_window(0, 0, window=content, anchor="nw")
+        canvas.create_window(0, 0, window=content, anchor="nw", tags=("page",))
         content.bind(
             "<Configure>",
             lambda _event, target=canvas: target.configure(
@@ -2039,11 +2039,18 @@ class StockDynamicApp:
         )
         canvas.bind(
             "<Configure>",
-            lambda event, target=canvas, item=window_item: target.itemconfigure(
-                item, width=event.width
-            ),
+            lambda _event: self.fit_page(canvas, content),
         )
         return canvas, content
+
+    @staticmethod
+    def fit_page(canvas: tk.Canvas, content: ttk.Frame) -> None:
+        # Fill spare viewport height, but never shrink the scrollable content
+        # below the height needed by its cards and chart/table panels.
+        canvas.itemconfigure(
+            "page", width=canvas.winfo_width(),
+            height=max(canvas.winfo_height(), content.winfo_reqheight()),
+        )
 
     def create_taiwan_stock_tree(self, parent: ttk.Frame) -> ttk.Treeview:
         table_frame = ttk.Frame(parent, style="Card.TFrame")
@@ -2363,7 +2370,11 @@ class StockDynamicApp:
         return "break"
 
     def refresh_page_scrollregions(self) -> None:
-        for canvas in (self.taiwan_scroll_canvas, self.us_scroll_canvas):
+        for canvas, content in (
+            (self.taiwan_scroll_canvas, self.taiwan_content),
+            (self.us_scroll_canvas, self.us_content),
+        ):
+            self.fit_page(canvas, content)
             canvas.configure(scrollregion=canvas.bbox("all"))
 
     def layout_for_width(self, width: int, force: bool = False) -> None:
@@ -4715,7 +4726,7 @@ class MarketOverviewWindow:
         self.scroll_canvas.yview_scroll(-int(event.delta / 120), "units")
 
     def layout_dashboard_for_width(self, width: int) -> None:
-        layout_width = 680 if width < 760 else 1000 if width < 1100 else 1280
+        layout_width = 680 if width < 760 else 800 if width < 850 else 1000 if width < 1100 else 1280
         if self.market_layout_width == layout_width:
             return
         self.market_layout_width = layout_width
