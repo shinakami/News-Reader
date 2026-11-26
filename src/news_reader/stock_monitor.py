@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Sequence
 
 from news_reader.cli_types import positive_int
+from news_reader.yahoo_tw import fetch_yahoo_tw_chart_items
 
 
 TWSE_API_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
@@ -342,25 +343,22 @@ def yahoo_time(meta: dict) -> str:
 
 
 def fetch_yahoo_quotes(timeout: int, retries: int) -> tuple[list[IndexQuote], str]:
-    quotes = []
-    api_time = ""
+    items = fetch_yahoo_tw_chart_items(list(YAHOO_INDICES), timeout, retries)
+    quotes, stamps = [], []
     for symbol, name in YAHOO_INDICES.items():
-        result = fetch_yahoo_chart(symbol, timeout, retries)
-        meta = result.get("meta", {})
-        market_time = yahoo_time(meta)
-        api_time = market_time or api_time
-        quotes.append(
-            IndexQuote(
-                name=name,
-                price=to_float(str(meta.get("regularMarketPrice", ""))),
-                previous_close=to_float(str(meta.get("previousClose", ""))),
-                open_price=to_float(str(meta.get("regularMarketOpen", ""))),
-                high=to_float(str(meta.get("regularMarketDayHigh", ""))),
-                low=to_float(str(meta.get("regularMarketDayLow", ""))),
-                market_time=market_time,
-            )
-        )
-    return quotes, f"Yahoo {api_time}".strip()
+        chart = items.get(symbol, {}).get("chart") or {}
+        row = chart.get("quote") or {}
+        price = to_float(str(row.get("price", "")))
+        if price is None or not row.get("refreshedTs"):
+            continue
+        stamp = datetime.fromisoformat(row["refreshedTs"].replace("Z", "+00:00")).astimezone()
+        stamps.append(stamp)
+        quotes.append(IndexQuote(name, price, to_float(str(row.get("previousClose"))),
+                                 to_float(str(row.get("openPrice"))), to_float(str(row.get("dayHighPrice"))),
+                                 to_float(str(row.get("dayLowPrice"))), stamp.strftime("%H:%M:%S")))
+    if not quotes:
+        raise RuntimeError("Yahoo 未提供有效指數報價")
+    return quotes, max(stamps).strftime("%Y%m%d %H:%M:%S")
 
 
 def fetch_yahoo_etf_quotes(timeout: int, retries: int) -> list[EtfQuote]:
@@ -418,8 +416,14 @@ def fetch_quotes(
         )
 
     ordered = sorted(quotes, key=lambda quote: list(INDICES.values()).index(quote.name))
+    if not any(quote.price is not None for quote in ordered):
+        raise RuntimeError("TWSE 未提供有效指數報價")
     query_time = data.get("queryTime", {})
     api_time = f"{query_time.get('sysDate', '')} {query_time.get('sysTime', '')}".strip()
+    stamps = [f"{row['d']} {row['t']}" for row in data.get("msgArray", [])
+              if row.get("d") and row.get("t") not in (None, "", "-") and to_float(row.get("z")) is not None]
+    if stamps:
+        api_time = max(stamps)
     return ordered, api_time, "TWSE"
 
 

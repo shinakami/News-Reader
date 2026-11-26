@@ -15,6 +15,7 @@ from news_reader.llm_client import (
     LlmRateLimitError,
 )
 from news_reader.news import read_news
+from news_reader.display import fit_window
 
 
 SYSTEM_INSTRUCTION = """你是台美股票市場儀表板內的研究助理。請使用繁體中文回答。
@@ -319,8 +320,7 @@ class MarketAiWindow:
 
         self.window = tk.Toplevel(parent)
         self.window.title("AI 盤勢分析｜今日摘要與問答")
-        self.window.geometry("980x760")
-        self.window.minsize(760, 620)
+        fit_window(self.window, (980, 760), (620, 480))
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.status_text = tk.StringVar(value="準備建立市場快照…")
         self.provider_text = tk.StringVar(value=self.client.provider_label)

@@ -2,6 +2,7 @@
 import sys
 import tkinter as tk
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,6 +11,70 @@ from news_reader.stock_dynamic import StockDynamicApp, update_quote_row, movemen
 
 
 class ResponsivePages(unittest.TestCase):
+    def test_high_dpi_compact_menu_and_readable_table(self):
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(str(exc))
+        self.addCleanup(root.destroy)
+        old_scale = root.tk.call("tk", "scaling")
+        self.addCleanup(root.tk.call, "tk", "scaling", old_scale)
+        root.tk.call("tk", "scaling", 2.0)  # 144 DPI (150% desktop scaling)
+        with patch.object(StockDynamicApp, "refresh"):
+            app = StockDynamicApp(root, 30, "auto", 5, 0, True, True, 80)
+            root.geometry("800x600")
+            root.update()
+            self.assertTrue(app.compact_actions.winfo_ismapped())
+            self.assertFalse(app.header_actions.winfo_ismapped())
+            self.assertGreaterEqual(int(app.style.lookup("Treeview", "rowheight")), 46)
+            self.assertLessEqual(app.compact_actions.winfo_rootx() + app.compact_actions.winfo_width(),
+                                 root.winfo_rootx() + root.winfo_width())
+            self.assertGreater(app.taiwan_scroll_canvas.winfo_height(), 150)
+            self.assertEqual(app.main_pane.cget("orient"), "vertical")
+
+    def test_vix_single_point_gap_and_history_view(self):
+        try:
+            root = tk.Tk()
+        except tk.TclError as exc:
+            self.skipTest(str(exc))
+        self.addCleanup(root.destroy)
+        with patch.object(StockDynamicApp, "refresh"):
+            app = StockDynamicApp(root, 30, "auto", 5, 0, True, True, 80)
+            for market, panel in app.vix_panels.items():
+                if app.active_page != market:
+                    app.switch_market_page()
+                root.update()
+                today = panel.today()
+                first = datetime.combine(today, datetime.min.time())
+                panel.history = [(today-timedelta(days=60-i), i+1) for i in range(60)]
+                panel.update([(first, 15), (first+timedelta(minutes=10), 54)])
+                self.assertIn("高度緊張", panel.status.get())
+                self.assertFalse(any(panel.mini.type(k) == "line" for k in panel.mini.find_all()))
+                for moment in (1000, 1100):
+                    panel.mini.event_generate("<ButtonPress-1>", x=10, y=10, time=moment)
+                    panel.mini.event_generate("<ButtonRelease-1>", x=10, y=10, time=moment+10)
+                root.update()
+                self.assertTrue(panel.window.winfo_viewable())
+                panel.mode.set("近 60 日收盤")
+                panel.redraw()
+                self.assertEqual(sum(panel.large.type(k) == "oval" for k in panel.large.find_all()), 60)
+                root.update()
+                chart = panel.large
+                x,y,stamp,value = chart.samples["sample59"]
+                chart.event_generate("<Button-1>", x=round(x), y=round(y))
+                self.assertEqual(chart.selected_time, stamp)
+                panel.redraw()
+                self.assertTrue(any(str(stamp) in chart.itemcget(k, "text")
+                                    for k in chart.find_withtag("inspection") if chart.type(k) == "text"))
+                panel.mode.set("今日盤中")
+                panel.redraw()
+                a,b = chart.samples.values()
+                chart.event_generate("<Button-1>", x=round((a[0]+b[0])/2), y=round((a[1]+b[1])/2))
+                self.assertFalse(chart.find_withtag("inspection"))
+                chart.event_generate("<Button-1>", x=round(a[0]), y=round(a[1]))
+                self.assertEqual(chart.selected_time, first)
+                panel.window.destroy()
+
     def test_height_resize_and_compact_to_wide(self):
         try:
             root = tk.Tk()

@@ -31,6 +31,10 @@ from PIL import Image, ImageColor, ImageOps, ImageTk
 
 from news_reader.cli_types import positive_int
 from news_reader.market_ai import MarketAiWindow
+from news_reader.display import display_scale, fit_window
+from news_reader.background_media import MediaPlayer, on_background
+from news_reader.vix_panel import VixPanel, daily_history
+from news_reader.yahoo_tw import fetch_yahoo_tw_chart_items, YAHOO_TW_CHART_URL
 from news_reader.stock_monitor import (
     INDICES,
     YAHOO_INDICES,
@@ -123,10 +127,6 @@ DEFAULT_TAIWAN_STOCKS = {
     "3231": "緯創",
 }
 TAIFEX_HISTORY_URL = "https://www.taifex.com.tw/cht/3/futDataDown"
-YAHOO_TW_CHART_URL = (
-    "https://tw.stock.yahoo.com/_td-stock/api/resource/"
-    "FinanceChartService.ApacLibraCharts"
-)
 
 ETF_LIST_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
 ETF_PRODUCTS_URL = "https://www.twse.com.tw/zh/ETFortune/ajaxProductsResult"
@@ -187,6 +187,13 @@ def trim_quote_rows(tree, keys):
     for key in tree.get_children():
         if key not in keep:
             tree.delete(key)
+
+
+def seed_watchlist(tree, symbols):
+    missing = ("--",) * (len(tree["columns"]) - 2)
+    for code, name in symbols.items():
+        if not tree.exists(code):
+            tree.insert("", "end", iid=code, values=(code, name, *missing))
 
 
 @dataclass(frozen=True)
@@ -451,97 +458,6 @@ def fetch_yahoo_candles(
     raise RuntimeError("Yahoo 歷史 K 線資料不足")
 
 
-def fetch_yahoo_tw_chart_items(
-    symbols: Sequence[str],
-    timeout: int,
-    retries: int,
-    period: str = "1m",
-    range_name: str = "1d",
-) -> dict[str, dict]:
-    """Fetch Yahoo Taiwan charts in bounded batches and return them by symbol."""
-    unique_symbols = list(dict.fromkeys(symbols))
-    if not unique_symbols:
-        return {}
-    attempts = max(0, retries) + 1
-    chunks = [
-        unique_symbols[index:index + 10]
-        for index in range(0, len(unique_symbols), 10)
-    ]
-
-    def fetch_chunk(chunk: list[str]) -> list[dict]:
-        encoded_symbols = urllib.parse.quote(
-            json.dumps(chunk, ensure_ascii=False, separators=(",", ":")),
-            safe="",
-        )
-        resource = (
-            f"{YAHOO_TW_CHART_URL};autoRefresh={int(time.time() * 1000)}"
-            f";period={period};range={range_name}"
-            f";symbols={encoded_symbols};type=null"
-        )
-        query = urllib.parse.urlencode(
-            {
-                "device": "desktop",
-                "ecma": "modern",
-                "intl": "tw",
-                "lang": "zh-Hant-TW",
-                "region": "TW",
-                "site": "finance",
-                "tz": "Asia/Taipei",
-                "returnMeta": "true",
-            }
-        )
-        request = urllib.request.Request(
-            f"{resource}?{query}",
-            headers={
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://tw.stock.yahoo.com/",
-                "Cache-Control": "no-cache",
-                "Connection": "close",
-            },
-        )
-        last_error: Exception | None = None
-        for attempt in range(attempts):
-            try:
-                with urllib.request.urlopen(request, timeout=timeout) as response:
-                    payload = json.loads(response.read().decode("utf-8"))
-                return payload.get("data") or []
-            except urllib.error.HTTPError as exc:
-                last_error = exc
-                if exc.code in {400, 404}:
-                    break
-            except (OSError, json.JSONDecodeError) as exc:
-                last_error = exc
-            if attempt < attempts - 1:
-                time.sleep(0.3 * (attempt + 1))
-        raise RuntimeError(f"Yahoo 台灣批次行情載入失敗：{last_error}")
-
-    def fetch_resilient_chunk(chunk: list[str]) -> list[dict]:
-        try:
-            return fetch_chunk(chunk)
-        except RuntimeError:
-            if len(chunk) <= 1:
-                return []
-            middle = len(chunk) // 2
-            return [
-                *fetch_resilient_chunk(chunk[:middle]),
-                *fetch_resilient_chunk(chunk[middle:]),
-            ]
-
-    items: dict[str, dict] = {}
-    with ThreadPoolExecutor(max_workers=min(3, len(chunks))) as executor:
-        futures = [
-            executor.submit(fetch_resilient_chunk, chunk)
-            for chunk in chunks
-        ]
-        for future in as_completed(futures):
-            rows = future.result()
-            for item in rows:
-                symbol = item.get("symbol")
-                if symbol:
-                    items[symbol] = item
-    if not items:
-        raise RuntimeError("Yahoo 台灣批次行情未回傳任何資料")
-    return items
 
 
 def security_quote_from_yahoo_tw_item(
@@ -1331,6 +1247,43 @@ def vix_intraday(meta: dict, now: datetime) -> str:
     return f"Yahoo｜{price:.2f} 點｜盤中（可能延遲）{local:%m-%d %H:%M:%S} 美東"
 
 
+def fetch_taiwan_vix(timeout: int, verify_ssl: bool, points=None) -> str:
+    now = datetime.now(timezone(timedelta(hours=8)))
+    def read(url, body=None):
+        req = urllib.request.Request(url, data=body, headers={
+            "User-Agent": "Mozilla/5.0", "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout, context=make_context(verify_ssl)) as response:
+            return response.read()
+
+    if now.weekday() < 5 and clock_time(8, 45) <= now.time() < clock_time(13, 45):
+        try:
+            data = json.loads(read("https://mis.taifex.com.tw/futures/api/getQuoteListVIX",
+                                   b'{"SortColumn":"","AscDesc":"A"}'))
+            for row in data["RtData"]["QuoteList"]:
+                if row["SymbolID"] != "TAIWANVIX":
+                    continue
+                stamp = datetime.strptime(row["CDate"] + row["CTime"], "%Y%m%d%H%M%S").replace(tzinfo=now.tzinfo)
+                price = float(row["CLastPrice"])
+                if 0 <= (now - stamp).total_seconds() <= 300 and math.isfinite(price) and price > 0:
+                    if points is not None:
+                        points.append((stamp, price))
+                    return f"{price:.2f} 點｜盤中 {stamp:%Y-%m-%d %H:%M:%S}"
+        except (KeyError, TypeError, ValueError, OSError, HTTPException):
+            pass
+    previous = now.replace(day=1) - timedelta(days=1)
+    for month in (now, previous):
+        url = f"https://www.taifex.com.tw/file/taifex/Dailydownload/vix/log2data/{month:%Y%m}new.txt"
+        try:
+            rows = re.findall(rb"(?m)^([0-9]{8})\s+([0-9]{8})[ \t]+([0-9]+\.[0-9]+)[ \t]+[0-9.]+", read(url))
+            if rows:
+                day, tick, price = max(rows)
+                stamp = datetime.strptime((day + tick[:6]).decode(), "%Y%m%d%H%M%S")
+                return f"{float(price):.2f} 點｜收盤 {stamp:%Y-%m-%d %H:%M:%S}"
+        except (OSError, ValueError, HTTPException):
+            continue
+    raise ValueError("期交所暫無可用報價")
+
+
 def fetch_vix_close(timeout: int, verify_ssl: bool) -> str:
     url = "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
     request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -1628,6 +1581,8 @@ def row_from_mis(item: dict[str, str], fallback: EtfMarketRow | None = None) -> 
         elif bid is not None and ask is not None:
             price = (bid + ask) / 2
     previous_close = to_float(item.get("y"))
+    if price is None and fallback is not None:
+        return fallback
     is_limit_up = (
         price is not None
         and limit_up_price is not None
@@ -1649,7 +1604,7 @@ def row_from_mis(item: dict[str, str], fallback: EtfMarketRow | None = None) -> 
         volume=to_int(item.get("v")) or (fallback.volume if fallback else None),
         trade_value=fallback.trade_value if fallback else None,
         transaction=fallback.transaction if fallback else None,
-        market_time=item.get("t") or item.get("%") or (fallback.market_time if fallback else "--"),
+        market_time=" ".join(filter(None, (item.get("d"), item.get("t") or item.get("%")))) or "--",
         source="TWSE MIS",
         limit_up_price=limit_up_price,
         limit_down_price=limit_down_price,
@@ -1662,26 +1617,34 @@ def chunked(values: list[str], size: int) -> list[list[str]]:
     return [values[index : index + size] for index in range(0, len(values), size)]
 
 
-def fetch_all_etf_quotes(timeout: int, retries: int, verify_ssl: bool) -> list[EtfMarketRow]:
-    openapi_rows = fetch_etf_list(timeout, verify_ssl)
-    try:
-        profiles = fetch_etf_profile_map(timeout, verify_ssl)
-    except Exception:
-        profiles = {}
-    fallback = {row["Code"]: row_from_openapi(row) for row in openapi_rows}
-    codes = list(fallback)
-    quotes: dict[str, EtfMarketRow] = {}
-
-    for group in chunked(codes, ETF_BATCH_SIZE):
+def fetch_all_etf_quotes(timeout: int, retries: int, verify_ssl: bool, on_rows=None) -> list[EtfMarketRow]:
+    def fetch_group(group):
         symbols = "|".join(f"tse_{code}.tw" for code in group)
+        data = fetch_twse_json(symbols, timeout, verify_ssl, retries)
+        return {item["c"]: row_from_mis(item, fallback[item["c"]])
+                for item in data.get("msgArray", []) if item.get("c") in fallback}
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        profile_job = pool.submit(fetch_etf_profile_map, timeout, verify_ssl)
+        openapi_rows = fetch_etf_list(timeout, verify_ssl)
+        fallback = {row["Code"]: row_from_openapi(row) for row in openapi_rows}
+        codes = list(fallback)
+        if on_rows:
+            on_rows(list(fallback.values()))
+        jobs = [pool.submit(fetch_group, group) for group in chunked(codes, ETF_BATCH_SIZE)]
+        quotes = {}
+        for job in as_completed(jobs):
+            try:
+                batch = job.result()
+            except RuntimeError:
+                continue
+            quotes.update(batch)
+            if on_rows and batch:
+                on_rows(list(batch.values()))
         try:
-            data = fetch_twse_json(symbols, timeout, verify_ssl, retries)
-            for item in data.get("msgArray", []):
-                code = item.get("c", "")
-                quotes[code] = row_from_mis(item, fallback.get(code))
-        except RuntimeError:
-            for code in group:
-                quotes[code] = fallback[code]
+            profiles = profile_job.result()
+        except Exception:
+            profiles = {}
 
     rows = [
         enrich_etf_row(quotes.get(code, fallback[code]), profiles.get(code))
@@ -1745,6 +1708,11 @@ class StockDynamicApp:
         self.candles: dict[str, list[MarketCandle]] = defaultdict(list)
         self.candle_grains: dict[str, str] = {}
         self.chart_mode = ""
+        self.tw_pending = set()
+        self.tw_errors = {}
+        self.tw_history_key = None
+        self.tw_history_updated = 0.0
+        self.tw_api_time = ""
         self.index_previous_close: dict[str, float | None] = {}
         self.etf_rows: dict[str, EtfMarketRow] = {}
         self.tw_stock_symbols = dict(DEFAULT_TAIWAN_STOCKS)
@@ -1758,7 +1726,9 @@ class StockDynamicApp:
         self.us_index_rows: dict[str, SecurityQuote] = {}
         self.adr_rows: dict[str, SecurityQuote] = {}
         self.us_stock_rows: dict[str, SecurityQuote] = {}
-        self.us_history_loaded_at = 0.0
+        self.us_history_loaded = {}
+        self.us_pending = set()
+        self.us_errors = {}
         self.market_window: MarketOverviewWindow | None = None
         self.futures_window: TaiwanFuturesWindow | None = None
         self.ai_market_window: MarketAiWindow | None = None
@@ -1767,13 +1737,22 @@ class StockDynamicApp:
         self.background_settings_window: tk.Toplevel | None = None
         self.background_image: Image.Image | None = None
         self.background_image_path = ""
+        self.background_player = None
+        self.background_play_job = None
         self.background_transparency = tk.DoubleVar(value=65.0)
-        self.background_transparency_text = tk.StringVar(value="圖片透明度：65%")
-        self.background_file_text = tk.StringVar(value="尚未載入背景圖片")
+        self.background_transparency_text = tk.StringVar(value="背景透明度：65%")
+        self.background_file_text = tk.StringVar(value="尚未載入背景媒體")
         self.background_mode_text = tk.StringVar(value="填滿")
         self.background_photo_refs: dict[tk.Canvas, ImageTk.PhotoImage] = {}
-        self.background_frame_labels: dict[ttk.Frame, tk.Label] = {}
+        self.background_frame_labels: dict[ttk.Frame, tk.Canvas] = {}
         self.background_frame_photos: dict[ttk.Frame, ImageTk.PhotoImage] = {}
+        self.wallpaper_surfaces = {}
+        self.wallpaper_positions = {}
+        self.wallpaper_hosts = set()
+        self.prepared_wallpaper = {}
+        self.wallpaper_layout_due = 0.0
+        self.wallpaper_ready = frozenset()
+        self.wallpaper_pause_until = 0.0
         self.background_render_cache: dict[tuple[object, ...], Image.Image] = {}
         self.background_bound_hosts: set[str] = set()
         self.background_redraw_job: str | None = None
@@ -1786,8 +1765,8 @@ class StockDynamicApp:
         self.theme = THEMES[self.theme_name]
 
         self.root.title("股票動態儀表板")
-        self.root.geometry("1240x840")
-        self.root.minsize(680, 520)
+        fit_window(self.root, (1240, 840), (560, 440))
+        self.resize_chart_job = None
         self.root.configure(bg=self.theme["bg"])
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -1798,14 +1777,16 @@ class StockDynamicApp:
         self.market_page_button_text = tk.StringVar(value="切換美股")
         self.style = ttk.Style()
         self.card_widgets: list[ttk.Frame] = []
-        self.current_layout: tuple[int, bool, bool, bool, int] | None = None
+        self.current_layout = None
+        self.wallpaper_ui_cost = 0.0
+        self.wallpaper_poll_due = 0.0
         self.build_ui()
         self.register_global_background(self.root)
         self.apply_theme()
         self.root.bind("<Configure>", self.on_root_resize)
         self.root.bind("<MouseWheel>", self.on_page_mousewheel, add="+")
         self.refresh()
-        self.root.after(200, self.process_results)
+        self.root.after(50, self.process_results)
 
     def build_ui(self) -> None:
         self.style.theme_use("clam")
@@ -1829,7 +1810,7 @@ class StockDynamicApp:
             style="Muted.TLabel",
             font=("Microsoft JhengHei UI", 10),
         )
-        subtitle.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        subtitle.grid(row=1, column=0, columnspan=2, sticky="w", pady=(2, 0))
         self.status_label = ttk.Label(
             self.header_inner,
             textvariable=self.status_text,
@@ -1884,6 +1865,13 @@ class StockDynamicApp:
                 command=self.refresh_all,
             ),
         ]
+        self.compact_actions = ttk.Menubutton(self.header_inner, text="功能選單")
+        menu = tk.Menu(self.compact_actions, tearoff=False, background=self.theme["surface"],
+                       foreground=self.theme["text"])
+        for button in self.header_action_buttons:
+            menu.add_command(label=button.cget("text"), command=button.invoke)
+        menu.configure(postcommand=lambda: menu.entryconfigure(2, label=self.market_page_button_text.get()))
+        self.compact_actions.configure(menu=menu)
         for index, button in enumerate(self.header_action_buttons):
             button.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 4, 0))
         self.header_inner.columnconfigure(0, weight=1)
@@ -1933,12 +1921,20 @@ class StockDynamicApp:
             self.card_frame.columnconfigure(idx, weight=1, uniform="cards")
 
         self.body = ttk.Frame(self.taiwan_content, style="TFrame", height=520)
-        self.body.pack(fill="both", expand=True, padx=16, pady=(4, 16))
         self.body.grid_propagate(False)
         self.body.columnconfigure(0, weight=3)
         self.body.columnconfigure(1, weight=2)
         self.body.rowconfigure(0, weight=1)
 
+        self.tw_vix_text = tk.StringVar(value="臺指 VIX｜等待期交所行情")
+        self.tw_vix_next = 0.0
+        self.tw_vix_last = ""
+        ttk.Label(self.taiwan_content, textvariable=self.tw_vix_text,
+                  style="CardTitle.TLabel", padding=(12, 6)).pack(fill="x", padx=16)
+        self.vix_panels = {"taiwan": VixPanel(self.taiwan_content, "臺指 VIX", self.tw_vix_text,
+            self.theme, lambda: datetime.now(timezone(timedelta(hours=8))).date())}
+        self.vix_history_due = {"taiwan": 0.0, "us": 0.0}
+        self.body.pack(fill="both", expand=True, padx=16, pady=(4, 16))
         self.main_pane = tk.PanedWindow(
             self.body,
             orient="horizontal",
@@ -1993,7 +1989,7 @@ class StockDynamicApp:
                 )
                 self.index_canvases[name] = canvas
                 row_pane.add(canvas, stretch="always", minsize=180)
-                canvas.bind("<Configure>", lambda _event, n=name: self.draw_one_index_chart(n))
+                canvas.bind("<Configure>", self.queue_visible_charts)
 
         self.right_panel = ttk.Frame(self.main_pane, style="TFrame")
         self.right_panel.rowconfigure(0, weight=1)
@@ -2104,6 +2100,7 @@ class StockDynamicApp:
             font=("Microsoft JhengHei UI", 8),
         ).pack(anchor="w", pady=(2, 6))
         self.tw_stock_tree = self.create_taiwan_stock_tree(self.tw_stock_panel)
+        seed_watchlist(self.tw_stock_tree, self.tw_stock_symbols)
         self.tw_stock_tree.bind("<Double-1>", self.open_selected_taiwan_stock)
         self.tw_stock_tree.bind("<Return>", self.open_selected_taiwan_stock)
 
@@ -2315,6 +2312,8 @@ class StockDynamicApp:
         self.vix_close_expiry = 0.0
         ttk.Label(self.us_chart_panel, textvariable=self.vix_text,
                   style="CardTitle.TLabel").pack(anchor="w", pady=(0, 4))
+        self.vix_panels["us"] = VixPanel(self.us_chart_panel, "美國 VIX", self.vix_text,
+            self.theme, lambda: datetime.now(us_eastern_timezone(datetime.now(timezone.utc))).date())
         self.us_chart_grid = ttk.Frame(self.us_chart_panel, style="Card.TFrame")
         self.us_chart_grid.pack(fill="both", expand=True)
         self.us_chart_canvases: dict[str, tk.Canvas] = {}
@@ -2337,7 +2336,7 @@ class StockDynamicApp:
             )
             canvas.bind(
                 "<Configure>",
-                lambda _event, chart_name=name: self.draw_one_us_chart(chart_name),
+                self.queue_visible_charts,
             )
             self.us_chart_canvases[name] = canvas
         for column in range(2):
@@ -2368,6 +2367,7 @@ class StockDynamicApp:
             font=("Microsoft JhengHei UI", 8),
         ).pack(anchor="w", pady=(2, 6))
         self.adr_tree = self.create_security_tree(adr_panel)
+        seed_watchlist(self.adr_tree, TAIWAN_ADR_SYMBOLS)
 
         stocks_panel = ttk.Frame(
             self.us_tables_pane,
@@ -2403,6 +2403,7 @@ class StockDynamicApp:
             font=("Microsoft JhengHei UI", 8),
         ).pack(anchor="w", pady=(2, 6))
         self.us_stock_tree = self.create_security_tree(stocks_panel)
+        seed_watchlist(self.us_stock_tree, self.us_stock_symbols)
 
         self.us_tables_pane.add(adr_panel, stretch="always", minsize=170)
         self.us_tables_pane.add(stocks_panel, stretch="always", minsize=210)
@@ -2471,6 +2472,7 @@ class StockDynamicApp:
             self.schedule_background_redraw()
 
     def on_page_mousewheel(self, event: tk.Event) -> str | None:
+        self.defer_wallpaper_paint()
         if isinstance(event.widget, ttk.Treeview):
             return None
         canvas = (
@@ -2490,6 +2492,9 @@ class StockDynamicApp:
             canvas.configure(scrollregion=canvas.bbox("all"))
 
     def layout_for_width(self, width: int, force: bool = False) -> None:
+        physical_width = width
+        scale = display_scale(self.root)
+        width = round(width / scale)
         card_columns = 4
         if width < 620:
             card_columns = 1
@@ -2499,21 +2504,18 @@ class StockDynamicApp:
         stacked_body = width < 900
         compact_charts = width < 760
         stacked_header = width < 1120
-        action_columns = 3 if width < 840 else 6
-        layout_key = (card_columns, stacked_body, compact_charts, stacked_header, action_columns)
+        action_columns = 2 if width < 500 else 3 if width < 840 else 6
+        menu_only = stacked_header and (width < 590 or self.root.winfo_height() / scale < 490)
+        layout_key = (card_columns, stacked_body, compact_charts, stacked_header, action_columns, menu_only)
+        wrap = max(120, physical_width - round(80 * scale))
+        for label in (self.source_label, self.status_label):
+            label.configure(wraplength=wrap if stacked_header else wrap // 2, justify="left")
         if self.current_layout == layout_key and not force:
             return
         self.current_layout = layout_key
-        self.source_label.configure(
-            wraplength=max(300, width - 80),
-            justify="left",
-        )
-        self.status_label.configure(
-            wraplength=max(300, width - 80),
-            justify="left",
-        )
 
         self.header_actions.grid_forget()
+        self.compact_actions.grid_remove()
         self.source_label.grid_forget()
         if stacked_header:
             self.source_label.grid(
@@ -2533,6 +2535,10 @@ class StockDynamicApp:
         else:
             self.source_label.grid(row=2, column=1, sticky="e", pady=(8, 0))
             self.header_actions.grid(row=0, column=1, sticky="e")
+        if menu_only:
+            self.header_actions.grid_remove()
+            self.compact_actions.grid(row=0, column=1, sticky="e")
+        self.status_label.grid_configure(columnspan=2 if stacked_header else 1)
         for row in range(2):
             self.header_actions.rowconfigure(row, weight=0)
         for column in range(6):
@@ -2616,7 +2622,7 @@ class StockDynamicApp:
             self.us_main_pane.configure(orient="horizontal")
             self.main_pane.grid(row=0, column=0, columnspan=2, sticky="nsew")
 
-        body_height = 1050 if compact_charts else 860 if stacked_body else 520
+        body_height = round((1050 if compact_charts else 860 if stacked_body else 520) * scale)
         self.body.configure(height=body_height)
         self.us_main_pane.configure(height=body_height)
         for row_pane in self.chart_rows:
@@ -2654,10 +2660,18 @@ class StockDynamicApp:
         for column in range(us_columns):
             self.us_chart_grid.columnconfigure(column, weight=1, uniform="us_charts")
 
-        self.draw_chart()
-        self.draw_us_charts()
+        self.queue_visible_charts()
         self.root.after_idle(self.position_responsive_panes)
         self.root.after_idle(self.refresh_page_scrollregions)
+
+    def queue_visible_charts(self, _event=None):
+        # Coalesce resize bursts from eight canvases into one visible-page draw.
+        if self.resize_chart_job is None and not self.closed:
+            self.resize_chart_job = self.root.after(32, self.draw_resized_page)
+
+    def draw_resized_page(self):
+        self.resize_chart_job = None
+        (self.draw_us_charts if self.active_page == "us" else self.draw_chart)()
 
     def position_responsive_panes(self) -> None:
         stacked = self.current_layout[1] if self.current_layout else False
@@ -2697,8 +2711,7 @@ class StockDynamicApp:
         window = tk.Toplevel(self.root)
         self.background_settings_window = window
         window.title("Dashboard 背景設定")
-        window.geometry("520x315")
-        window.minsize(460, 295)
+        fit_window(window, (520, 315), (460, 295))
         window.transient(self.root)
         window.configure(bg=self.theme["bg"])
         window.protocol("WM_DELETE_WINDOW", self.close_background_settings)
@@ -2720,7 +2733,7 @@ class StockDynamicApp:
 
         ttk.Button(
             panel,
-            text="載入圖片",
+            text="載入圖片／動畫／影片",
             style="Flat.TButton",
             command=self.load_background_image,
         ).grid(row=2, column=0, sticky="w")
@@ -2753,7 +2766,7 @@ class StockDynamicApp:
         ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(5, 0))
         ttk.Label(
             panel,
-            text="圖片配置",
+            text="背景配置",
             style="CardTitle.TLabel",
             font=("Microsoft JhengHei UI", 10, "bold"),
         ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(16, 5))
@@ -2778,15 +2791,23 @@ class StockDynamicApp:
     def load_background_image(self) -> None:
         path = filedialog.askopenfilename(
             parent=self.background_settings_window or self.root,
-            title="選擇 Dashboard 背景圖片",
+            title="選擇 Dashboard 背景媒體",
             filetypes=[
-                ("圖片檔案", "*.png *.jpg *.jpeg *.bmp *.gif *.webp"),
+                ("支援的媒體", "*.png *.jpg *.jpeg *.bmp *.gif *.webp *.mp4"),
+                ("GIF 動畫", "*.gif"),
+                ("MP4 影片（靜音循環）", "*.mp4"),
                 ("PNG", "*.png"),
                 ("JPEG", "*.jpg *.jpeg"),
                 ("所有檔案", "*.*"),
             ],
         )
         if not path:
+            return
+        if Path(path).suffix.lower() in {".gif", ".mp4"}:
+            self.stop_background_playback()
+            self.background_file_text.set(f"正在載入：{Path(path).name}")
+            self.background_player = MediaPlayer(path, self.animation_specs())
+            self.poll_background_frame(path)
             return
         try:
             with Image.open(path) as source_image:
@@ -2799,25 +2820,130 @@ class StockDynamicApp:
             )
             return
 
+        self.stop_background_playback()
         self.background_image_path = path
         self.background_file_text.set(f"已載入：{Path(path).name}")
         self.status_text.set(f"Dashboard 背景已更新：{Path(path).name}")
         self.background_render_cache.clear()
         self.redraw_background_charts()
 
+    def stop_background_playback(self):
+        self.wallpaper_ui_cost = self.wallpaper_poll_due = 0.0
+        self.prepared_wallpaper.clear()
+        self.wallpaper_layout_due = 0.0
+        self.wallpaper_ready = frozenset()
+        self.wallpaper_surfaces.clear()
+        self.wallpaper_positions.clear()
+        if self.background_player:
+            self.background_player.stop.set()
+            self.background_player = None
+        if self.background_play_job:
+            self.root.after_cancel(self.background_play_job)
+            self.background_play_job = None
+
+    def animation_specs(self):
+        opacity = 100 - round(self.background_transparency.get())
+        specs = set()
+        for host in tuple(self.wallpaper_hosts):
+            if not host.winfo_exists():
+                self.wallpaper_hosts.discard(host)
+            elif opacity and host.winfo_viewable():
+                specs.add(((max(1, host.winfo_width()), max(1, host.winfo_height())),
+                           self.background_mode(), opacity, self.theme["bg"]))
+        return tuple(specs)
+
+    def animation_visible(self, widget):
+        hidden = self.us_page if self.active_page == "taiwan" else self.taiwan_page
+        return not (widget == hidden or str(widget).startswith(str(hidden) + ".")) and widget.winfo_viewable()
+
+    def poll_background_frame(self, path):
+        started = time.monotonic()
+        self.background_play_job = None
+        player = self.background_player
+        if self.closed or player is None:
+            return
+        player.specs = self.animation_specs()
+        if started < self.wallpaper_pause_until:
+            self.wallpaper_poll_due = 0.0
+            self.background_play_job = self.root.after(32, self.poll_background_frame, path)
+            return
+        try:
+            frame, prepared, error, done = player.latest.pop()
+        except IndexError:
+            pass
+        else:
+            if error:
+                self.stop_background_playback()
+                self.status_text.set("背景播放失敗：" + Path(path).name)
+                messagebox.showerror("背景媒體無法播放", error,
+                                     parent=self.background_settings_window or self.root)
+                return
+            first = self.background_image_path != path or not self.wallpaper_layout_due
+            self.background_image_path = path
+            if first:
+                self.background_file_text.set(f"已載入：{Path(path).name}")
+            if frame is not None:
+                self.background_image = frame
+            elif self.background_image is None and prepared:
+                # The GUI may miss the entire warm-up loop while a dialog is
+                # open. Cached surfaces are already ready to show.
+                self.background_image = next(iter(prepared.values()))
+            self.prepared_wallpaper = prepared
+            self.background_render_cache.clear()
+            ready = frozenset(prepared).intersection(player.specs)
+            layout_changed = ready != self.wallpaper_ready
+            self.wallpaper_ready = ready
+            if ready:
+                # One upload per visible window. Tk invalidates all existing
+                # image items; there is no need to walk every widget per frame.
+                for host in self.wallpaper_hosts:
+                    if host.winfo_viewable():
+                        rendered = self.build_host_background(host, self.theme)
+                        if rendered is not None:
+                            self.shared_wallpaper(host, rendered)
+                if first or layout_changed or started >= self.wallpaper_layout_due:
+                    self.redraw_global_backgrounds()
+                    for canvas in list(self.background_photo_refs):
+                        if not canvas.winfo_exists():
+                            self.background_photo_refs.pop(canvas, None)
+                        elif self.animation_visible(canvas):
+                            self.draw_canvas_background(canvas, canvas.winfo_width(), canvas.winfo_height())
+                    if first or layout_changed:
+                        (self.draw_us_charts if self.active_page == "us" else self.draw_chart)()
+                        if self.futures_window and not self.futures_window.closed:
+                            self.futures_window.draw_charts()
+                    self.wallpaper_layout_due = started + 0.25
+            if done:
+                self.stop_background_playback()
+                self.redraw_background_charts()
+                return
+        # Check for GIF frames more frequently than the 40 ms interval used
+        # by many animations. Yield to Tk between paints; never queue a backlog.
+        cadence = 16 if path.lower().endswith(".gif") else 50
+        now = time.monotonic()
+        cost = (now - started) * 1000
+        lag = max(0, started - self.wallpaper_poll_due) * 1000 if self.wallpaper_poll_due else 0
+        self.wallpaper_ui_cost = .8 * self.wallpaper_ui_cost + .2 * min(100, cost + lag)
+        # Reserve event-loop time for quotes and input on slow devices. This
+        # changes only decorative frame presentation, never market polling.
+        delay = max(8, cadence - int(cost), int(self.wallpaper_ui_cost * 1.5))
+        self.wallpaper_poll_due = now + delay / 1000
+        self.background_play_job = self.root.after(delay, self.poll_background_frame, path)
+
     def clear_background_image(self) -> None:
+        self.stop_background_playback()
         self.background_image = None
         self.background_image_path = ""
-        self.background_file_text.set("尚未載入背景圖片")
+        self.background_file_text.set("尚未載入背景媒體")
         self.background_photo_refs.clear()
         self.background_frame_photos.clear()
         self.background_render_cache.clear()
-        self.status_text.set("Dashboard 背景圖片已清除")
+        self.status_text.set("Dashboard 背景已清除")
         self.redraw_background_charts()
 
     def on_background_transparency_changed(self, value: str) -> None:
         transparency = max(0, min(100, round(float(value))))
-        self.background_transparency_text.set(f"圖片透明度：{transparency}%")
+        self.background_transparency_text.set(f"背景透明度：{transparency}%")
         self.background_render_cache.clear()
         self.schedule_background_redraw()
 
@@ -2851,21 +2977,31 @@ class StockDynamicApp:
         children = list(container.winfo_children())
         for child in children:
             if isinstance(child, ttk.Frame) and child not in self.background_frame_labels:
-                self.background_frame_labels[child] = tk.Label(
+                self.background_frame_labels[child] = tk.Canvas(
                     child,
                     bd=0,
                     highlightthickness=0,
+                    width=1, height=1, bg=self.theme["bg"],
                 )
             self.register_global_background(child)
 
         host = container.winfo_toplevel()
+        self.wallpaper_hosts.add(host)
         host_key = str(host)
         if host_key not in self.background_bound_hosts:
             host.bind("<Configure>", self.on_background_host_resize, add="+")
+            for sequence in ("<B1-Motion>", "<MouseWheel>", "<ButtonPress-1>", "<KeyPress>"):
+                host.bind(sequence, self.defer_wallpaper_paint, add="+")
             self.background_bound_hosts.add(host_key)
+
+    def defer_wallpaper_paint(self, _event=None):
+        # Prefer input/scroll/resize over repainting decorative animation.
+        if self.background_player:
+            self.wallpaper_pause_until = time.monotonic() + .12
 
     def on_background_host_resize(self, event: tk.Event) -> None:
         if event.widget is event.widget.winfo_toplevel():
+            self.defer_wallpaper_paint()
             self.background_render_cache.clear()
             self.schedule_background_redraw(90)
 
@@ -2886,6 +3022,11 @@ class StockDynamicApp:
         width = max(1, int(host.winfo_width()))
         height = max(1, int(host.winfo_height()))
         mode = self.background_mode()
+        if self.background_player:
+            # A resize/settings change may be one decoded frame ahead of us.
+            # Never synchronously scale a large source as a fallback.
+            return self.prepared_wallpaper.get(((width, height), mode,
+                                                round(image_visibility * 100), theme["bg"]))
         cache_key = (
             str(host),
             width,
@@ -2901,21 +3042,23 @@ class StockDynamicApp:
 
         base_color = ImageColor.getrgb(theme["bg"])
         base = Image.new("RGB", (width, height), base_color)
-        layout = Image.new("RGB", (width, height), base_color)
-        source = self.background_image
+        source = on_background(self.background_image, theme["bg"])
+        resample = Image.Resampling.BILINEAR if self.background_player else Image.Resampling.LANCZOS
+        if mode not in ("stretch", "fill"):
+            layout = base.copy()
         if mode == "stretch":
-            layout = source.resize((width, height), Image.Resampling.LANCZOS)
+            layout = source.resize((width, height), resample)
         elif mode == "fill":
             layout = ImageOps.fit(
                 source,
                 (width, height),
-                method=Image.Resampling.LANCZOS,
+                method=resample,
             )
         elif mode == "fit":
             fitted = ImageOps.contain(
                 source,
                 (width, height),
-                method=Image.Resampling.LANCZOS,
+                method=resample,
             )
             layout.paste(fitted, ((width - fitted.width) // 2, (height - fitted.height) // 2))
         elif mode == "tile":
@@ -2946,6 +3089,18 @@ class StockDynamicApp:
         y = widget.winfo_rooty() - host.winfo_rooty()
         return host_background.crop((x, y, x + width, y + height))
 
+    def shared_wallpaper(self, host, rendered):
+        previous = self.wallpaper_surfaces.get(host)
+        if previous and previous[0] is rendered:
+            return previous[1]
+        if previous and previous[0].size == rendered.size:
+            photo = previous[1]
+            photo.paste(rendered)
+        else:
+            photo = ImageTk.PhotoImage(rendered, master=host)
+        self.wallpaper_surfaces[host] = (rendered, photo)
+        return photo
+
     def redraw_global_backgrounds(self) -> None:
         if self.background_image is None or self.background_transparency.get() >= 100:
             for label in self.background_frame_labels.values():
@@ -2954,6 +3109,7 @@ class StockDynamicApp:
                 except tk.TclError:
                     pass
             self.background_frame_photos.clear()
+            self.wallpaper_positions.clear()
             return
 
         invalid_frames: list[ttk.Frame] = []
@@ -2962,12 +3118,30 @@ class StockDynamicApp:
                 if not frame.winfo_exists():
                     invalid_frames.append(frame)
                     continue
+                if self.background_player and (not self.animation_visible(frame)
+                                               or not self.has_exposed_background(frame, label)):
+                    if frame in self.wallpaper_positions:
+                        label.delete("wallpaper")
+                        label.place_forget()
+                        self.wallpaper_positions.pop(frame, None)
+                    continue
                 host = frame.winfo_toplevel()
                 frame_width = max(1, frame.winfo_width())
                 frame_height = max(1, frame.winfo_height())
                 host_background = self.build_host_background(host, self.theme)
                 if host_background is None:
                     label.place_forget()
+                    self.wallpaper_positions.pop(frame, None)
+                    continue
+                if self.background_player:
+                    # A frame-sized canvas clips the shared texture at draw time.
+                    photo = self.shared_wallpaper(host, host_background)
+                    x = host.winfo_rootx() - frame.winfo_rootx()
+                    y = host.winfo_rooty() - frame.winfo_rooty()
+                    position = (photo, x, y, host_background.size)
+                    if self.wallpaper_positions.get(frame) != position:
+                        self.place_wallpaper_tile(label, photo, x, y)
+                        self.wallpaper_positions[frame] = position
                     continue
                 crop = self.crop_widget_background(
                     host_background,
@@ -2978,14 +3152,55 @@ class StockDynamicApp:
                 )
                 photo = ImageTk.PhotoImage(crop, master=label)
                 self.background_frame_photos[frame] = photo
-                label.configure(image=photo)
-                label.place(x=0, y=0, relwidth=1, relheight=1)
-                label.lower()
+                self.place_wallpaper_tile(label, photo, 0, 0)
             except tk.TclError:
                 invalid_frames.append(frame)
         for frame in invalid_frames:
             self.background_frame_labels.pop(frame, None)
             self.background_frame_photos.pop(frame, None)
+            self.wallpaper_positions.pop(frame, None)
+        for host in list(self.wallpaper_surfaces):
+            if not host.winfo_exists():
+                del self.wallpaper_surfaces[host]
+
+    @staticmethod
+    def has_exposed_background(frame, tile):
+        # Container frames often sit entirely behind their children. A mapped
+        # wallpaper canvas there still gets invalidated on every Tk photo paste.
+        regions = [(0, 0, frame.winfo_width(), frame.winfo_height())]
+        for child in frame.winfo_children():
+            if child == tile or not child.winfo_ismapped() or isinstance(child, tk.Toplevel):
+                continue
+            x, y = child.winfo_x(), child.winfo_y()
+            right, bottom = x + child.winfo_width(), y + child.winfo_height()
+            visible = []
+            for l,t,r,b in regions:
+                a,c,d,e = max(l,x), max(t,y), min(r,right), min(b,bottom)
+                if a >= d or c >= e:
+                    visible.append((l,t,r,b))
+                    continue
+                if t < c: visible.append((l,t,r,c))
+                if e < b: visible.append((l,e,r,b))
+                if l < a: visible.append((l,c,a,e))
+                if d < r: visible.append((d,c,r,e))
+            if not visible:
+                return False
+            regions = visible
+        return True
+
+    @staticmethod
+    def place_wallpaper_tile(tile, photo, x, y):
+        if tile.find_withtag("wallpaper"):
+            tile.itemconfigure("wallpaper", image=photo)
+            tile.coords("wallpaper", x, y)
+        else:
+            tile.create_image(x, y, anchor="nw", image=photo, tags="wallpaper")
+        if not tile.winfo_manager():
+            # The texture offset is relative to the frame's outer origin.
+            # ttk includes padding in its internal border; place's default
+            # "inside" would shift and clip every slice on padded cards.
+            tile.place(x=0, y=0, relwidth=1, relheight=1, bordermode="ignore")
+            tile.tk.call("lower", tile._w)
 
     def draw_canvas_background(
         self,
@@ -2994,7 +3209,7 @@ class StockDynamicApp:
         height: int,
         theme: dict[str, str] | None = None,
     ) -> bool:
-        if self.background_image is None:
+        if self.background_image is None or (self.background_player and not self.animation_visible(canvas)):
             self.background_photo_refs.pop(canvas, None)
             return False
 
@@ -3006,16 +3221,20 @@ class StockDynamicApp:
         if host_background is None:
             self.background_photo_refs.pop(canvas, None)
             return False
-        crop = self.crop_widget_background(
-            host_background,
-            canvas,
-            host,
-            target_width,
-            target_height,
-        )
-        photo = ImageTk.PhotoImage(crop, master=canvas)
+        x = y = 0
+        if self.background_player:
+            photo = self.shared_wallpaper(host, host_background)
+            x = host.winfo_rootx() - canvas.winfo_rootx()
+            y = host.winfo_rooty() - canvas.winfo_rooty()
+        else:
+            crop = self.crop_widget_background(host_background, canvas, host, target_width, target_height)
+            photo = ImageTk.PhotoImage(crop, master=canvas)
         self.background_photo_refs[canvas] = photo
-        canvas.create_image(0, 0, image=photo, anchor="nw", tags=("dashboard_background",))
+        if canvas.find_withtag("dashboard_background"):
+            canvas.itemconfigure("dashboard_background", image=photo)
+            canvas.coords("dashboard_background", x, y)
+        else:
+            canvas.create_image(x, y, image=photo, anchor="nw", tags=("dashboard_background",))
         return True
 
     def apply_theme(self) -> None:
@@ -3054,7 +3273,7 @@ class StockDynamicApp:
         self.style.map("TScrollbar", background=[("active", theme["selected"])])
         self.style.configure(
             "Treeview",
-            rowheight=32,
+            rowheight=round(32 * display_scale(self.root)),
             background=theme["surface"],
             fieldbackground=theme["surface"],
             foreground=theme["text"],
@@ -3111,6 +3330,7 @@ class StockDynamicApp:
             self.us_scroll_canvas.yview_moveto(0)
             self.market_page_button_text.set("返回台股")
             self.subtitle_text.set("美股四大指數、ADR 與美國個股")
+            self.show_us_status()
         else:
             self.taiwan_page.tkraise()
             self.taiwan_scroll_canvas.yview_moveto(0)
@@ -3127,6 +3347,7 @@ class StockDynamicApp:
             return
         if code not in self.tw_stock_symbols:
             self.tw_stock_symbols[code] = code
+            seed_watchlist(self.tw_stock_tree, {code: code})
         self.tw_stock_text.set("")
         self.status_text.set(f"已加入 {code}，正在更新台股個股行情...")
         self.schedule_refresh(0)
@@ -3138,6 +3359,7 @@ class StockDynamicApp:
             return
         if symbol not in self.us_stock_symbols:
             self.us_stock_symbols[symbol] = symbol
+            seed_watchlist(self.us_stock_tree, {symbol: symbol})
         self.us_symbol_text.set("")
         self.status_text.set(f"已加入 {symbol}，正在更新行情...")
         self.schedule_refresh(0)
@@ -3505,6 +3727,9 @@ class StockDynamicApp:
 
     def close(self) -> None:
         self.closed = True
+        if self.resize_chart_job is not None:
+            self.root.after_cancel(self.resize_chart_job)
+        self.stop_background_playback()
         if self.background_redraw_job:
             try:
                 self.root.after_cancel(self.background_redraw_job)
@@ -3547,92 +3772,162 @@ class StockDynamicApp:
             except tk.TclError:
                 pass
             self.refresh_job = None
-        self.loading = True
-        self.loading_page = self.active_page
-        self.status_text.set("正在更新行情...")
-        if self.active_page == "us" and time.monotonic() >= self.vix_next_fetch:
+        visible = {self.active_page}
+        visible.update(m for m,p in self.vix_panels.items() if p.window and p.window.winfo_exists())
+        for market in visible:
+            if time.monotonic() >= self.vix_history_due[market]:
+                self.vix_history_due[market] = float("inf")
+                threading.Thread(target=self.fetch_vix_history_worker,
+                                 args=(market, self.vix_panels[market].today()), daemon=True).start()
+        if "taiwan" in visible and time.monotonic() >= self.tw_vix_next:
+            self.tw_vix_next = float("inf")
+            threading.Thread(target=self.fetch_tw_vix_worker, daemon=True).start()
+        if "us" in visible and time.monotonic() >= self.vix_next_fetch:
             self.vix_next_fetch = float("inf")
             threading.Thread(target=self.fetch_vix_worker, daemon=True).start()
-        target = self.fetch_us_worker if self.active_page == "us" else self.fetch_worker
-        worker = threading.Thread(target=target, daemon=True)
-        worker.start()
+        if self.active_page == "us":
+            self.refresh_us_sections()
+            self.schedule_refresh(self.interval * 1000)
+            return
+        jobs = {
+            "指數": (fetch_market_data, (self.timeout, self.verify_ssl, self.retries, self.source, False)),
+            "個股": (fetch_taiwan_security_quotes, (dict(self.tw_stock_symbols), self.timeout, self.retries)),
+        }
+        if self.include_etfs:
+            preview = None if self.etf_rows else lambda rows: self.result_queue.put(("etf_preview", rows))
+            jobs["ETF"] = (fetch_all_etf_quotes, (self.timeout, self.retries, self.verify_ssl, preview))
+        mode = chart_mode_for_market_time(self.tw_api_time)
+        key = (datetime.now().date(), mode)
+        if self.tw_history_key != key or time.monotonic() - self.tw_history_updated >= 300:
+            jobs["K 線"] = (self.fetch_tw_histories, (key,))
+        for section, (fn, args) in jobs.items():
+            if section not in self.tw_pending:
+                self.tw_pending.add(section)
+                threading.Thread(target=self.run_section, args=(section, fn, args), daemon=True).start()
+        self.schedule_refresh(self.interval * 1000)
 
-    def fetch_worker(self) -> None:
+    def run_section(self, section, fn, args, kind="tw_section"):
         try:
-            quotes, api_time, data_source, _etfs = fetch_market_data(
-                self.timeout,
-                self.verify_ssl,
-                self.retries,
-                self.source,
-                False,
-            )
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                stock_future = executor.submit(
-                    fetch_taiwan_security_quotes,
-                    dict(self.tw_stock_symbols),
-                    self.timeout,
-                    self.retries,
-                )
-                etf_future = (
-                    executor.submit(
-                        fetch_all_etf_quotes,
-                        self.timeout,
-                        self.retries,
-                        self.verify_ssl,
-                    )
-                    if self.include_etfs
-                    else None
-                )
-                taiwan_stocks = stock_future.result()
-                all_etfs = etf_future.result() if etf_future else None
-            desired_mode = chart_mode_for_market_time(api_time)
-            histories: dict[str, list[MarketCandle]] = {}
-            grains: dict[str, str] = {}
-            if desired_mode != self.chart_mode:
-                for name in INDICES.values():
-                    symbol = YAHOO_SYMBOL_BY_NAME.get(name)
-                    if not symbol:
-                        continue
-                    try:
-                        candles, grain = fetch_yahoo_candles(
-                            symbol,
-                            self.timeout,
-                            self.retries,
-                            self.history_limit,
-                            prefer_intraday=desired_mode == "intraday",
-                        )
-                        histories[name] = candles
-                        grains[name] = grain
-                    except RuntimeError:
-                        if desired_mode == "intraday":
-                            histories[name] = []
-                            grains[name] = "5 分 K（即時建立）"
-                        else:
-                            histories[name] = []
-                            grains[name] = "日 K（即時建立）"
-            self.result_queue.put(
-                (
-                    "data",
-                    (
-                        quotes,
-                        api_time,
-                        data_source,
-                        all_etfs,
-                        taiwan_stocks,
-                        histories,
-                        grains,
-                        desired_mode,
-                    ),
-                )
-            )
+            payload = fn(*args)
+            self.result_queue.put((kind, (section, payload, None)))
         except Exception as exc:
-            self.result_queue.put(("error", exc))
+            self.result_queue.put((kind, (section, None, str(exc))))
+
+    def fetch_tw_histories(self, key):
+        intraday = key[1] == "intraday"
+        if not intraday:
+            def daily(symbol):
+                if symbol != "^TWOII":
+                    return fetch_yahoo_candles(symbol, self.timeout, self.retries, self.history_limit, False)[0]
+                rows = fetch_json("https://www.tpex.org.tw/openapi/v1/tpex_index", self.timeout, self.verify_ssl)
+                candles = []
+                for row in rows:
+                    day = datetime.strptime(row["Date"], "%Y%m%d")
+                    candles.append(MarketCandle(int(day.timestamp()), day.strftime("%Y-%m-%d"),
+                                   *(float(row[k].replace(",", "")) for k in ("Open", "High", "Low", "Close"))))
+                return sorted(candles, key=lambda c: c.timestamp)[-self.history_limit:]
+            histories = {}
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {pool.submit(daily, symbol): name for symbol, name in YAHOO_INDICES.items()}
+                for future in as_completed(futures):
+                    try:
+                        histories[futures[future]] = future.result()
+                    except (RuntimeError, OSError, ValueError, KeyError, HTTPException):
+                        histories[futures[future]] = []
+            return key, histories
+        items = fetch_yahoo_tw_chart_items(list(YAHOO_INDICES), self.timeout, self.retries,
+                                           "5m", "1d")
+        histories = {name: parse_yahoo_candles(items.get(symbol, {}).get("chart") or {},
+                                                self.history_limit, intraday)
+                     for symbol, name in YAHOO_INDICES.items()}
+        return key, histories
+
+    def apply_tw_section(self, section, data, error):
+        self.tw_pending.discard(section)
+        partial = False
+        if error is None and section == "指數":
+            quotes, stamp, source, _ = data
+            good = [q for q in quotes if q.price is not None]
+            partial = len(good) < len(INDICES)
+            if good:
+                self.tw_api_time = stamp
+                self.update_market(good, stamp, source)
+        elif error is None and section == "個股":
+            good = {k:v for k,v in data.items() if v.price is not None}
+            partial = len(good) < len(self.tw_stock_symbols)
+            if good:
+                self.update_taiwan_stocks({**self.tw_stock_rows, **good})
+        elif error is None and section == "ETF":
+            rows = dict(self.etf_rows)
+            seen = set()
+            for row in data:
+                old = rows.get(row.code)
+                if row.price is None or (old and old.source == "TWSE MIS" and row.source == "TWSE OpenAPI"
+                                         and roc_date_to_iso(row.market_time) <= old.market_time[:8]):
+                    partial = True
+                    continue
+                rows[row.code] = row
+                seen.add(row.code)
+            partial |= not seen or bool(rows.keys() - seen)
+            if seen:
+                order = dict.fromkeys([row.code for row in data] + list(rows))
+                self.update_etfs([rows[code] for code in order if code in rows])
+        elif error is None and section == "K 線":
+            key, histories = data
+            partial = not all(histories.values())
+            for name, candles in histories.items():
+                if candles:
+                    self.candles[name] = candles
+                    self.candle_grains[name] = "5 分 K" if key[1] == "intraday" else "日 K"
+            if not partial:
+                self.tw_history_key = key
+                self.tw_history_updated = time.monotonic()
+            self.chart_mode = key[1]
+            self.draw_chart()
+        if error or partial:
+            self.tw_errors[section] = error or "部分資料缺漏"
+        else:
+            self.tw_errors.pop(section, None)
+        if self.active_page == "taiwan":
+            suffix = "｜未更新：" + "、".join(self.tw_errors) if self.tw_errors else ""
+            self.status_text.set(f"指數行情時間：{self.tw_api_time or '--'}{suffix}")
+
+    def fetch_vix_history_worker(self, market, today):
+        def read(url):
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=self.timeout, context=make_context(self.verify_ssl)) as response:
+                return response.read()
+        try:
+            rows = daily_history(market, today, read)
+        except (ValueError, KeyError, OSError, HTTPException, csv.Error):
+            rows = []
+        self.result_queue.put(("vix_history", (market, rows)))
+
+    def fetch_tw_vix_worker(self) -> None:
+        points = []
+        try:
+            result = fetch_taiwan_vix(self.timeout, self.verify_ssl, points)
+        except (ValueError, OSError, HTTPException):
+            result = ""
+        self.result_queue.put(("tw_vix", (result, points)))
 
     def fetch_vix_worker(self) -> None:
+        points = []
         try:
             url = "https://query1.finance.yahoo.com/v8/finance/chart/%5EVIX?interval=1m&range=1d"
             data = fetch_json(url, self.timeout, self.verify_ssl)
-            result = vix_intraday(data["chart"]["result"][0]["meta"], datetime.now(timezone.utc))
+            chart = data["chart"]["result"][0]
+            now = datetime.now(timezone.utc)
+            meta = chart["meta"]
+            result = vix_intraday(meta, now)
+            tz = us_eastern_timezone(now)
+            if meta["symbol"] == "^VIX":
+                series = (chart.get("indicators", {}).get("quote") or [{}])[0]
+                for stamp, value in zip(chart.get("timestamp") or [], series.get("close") or []):
+                    if isinstance(value, (int, float)) and stamp <= now.timestamp():
+                        points.append((datetime.fromtimestamp(stamp,tz), value))
+            if result:
+                points.append((datetime.fromtimestamp(meta["regularMarketTime"],tz), float(meta["regularMarketPrice"])))
         except (OSError, ValueError, KeyError, TypeError, IndexError, HTTPException):
             result = ""
         if not result:
@@ -3643,155 +3938,138 @@ class StockDynamicApp:
                 result = self.vix_last_close
             except (OSError, ValueError, csv.Error, EOFError, HTTPException):
                 result = (self.vix_last_close or "暫無資料") + "（更新失敗）"
-        self.result_queue.put(("vix_close", result))
+        self.result_queue.put(("vix_close", (result, points)))
 
-    def fetch_us_worker(self) -> None:
-        try:
-            index_symbols = {
-                symbol: name for name, symbol in US_INDEX_SYMBOLS.items()
-            }
-            requested_symbols = {
-                **self.us_stock_symbols,
-                **TAIWAN_ADR_SYMBOLS,
-                **index_symbols,
-            }
-            all_quotes = fetch_yahoo_security_quotes(
-                requested_symbols,
-                self.timeout,
-                self.retries,
-            )
-            quote_by_symbol = {quote.symbol: quote for quote in all_quotes}
-            index_quotes = [
-                quote_by_symbol[symbol] for symbol in index_symbols
-            ]
-            adr_quotes = [
-                quote_by_symbol[symbol] for symbol in TAIWAN_ADR_SYMBOLS
-            ]
-            stock_quotes = [
-                quote_by_symbol[symbol] for symbol in self.us_stock_symbols
-            ]
+    def refresh_us_sections(self):
+        groups = {"指數": {symbol: name for name, symbol in US_INDEX_SYMBOLS.items()},
+                  "ADR": TAIWAN_ADR_SYMBOLS, "美國個股": self.us_stock_symbols}
+        jobs = {group: (fetch_yahoo_security_quotes, (dict(symbols), self.timeout, self.retries))
+                for group, symbols in groups.items()}
+        mode = chart_mode_for_us_quotes(list(self.us_index_rows.values()))
+        for name, symbol in US_INDEX_SYMBOLS.items():
+            old_mode, loaded = self.us_history_loaded.get(name, (None, 0))
+            if old_mode != mode or time.monotonic() - loaded >= 300:
+                jobs[name] = (self.fetch_us_history, (symbol, mode))
+        for section, (fn, args) in jobs.items():
+            if section not in self.us_pending:
+                self.us_pending.add(section)
+                threading.Thread(target=self.run_section,
+                                 args=(section, fn, args, "us_section"), daemon=True).start()
+        self.show_us_status()
 
-            desired_mode = chart_mode_for_us_quotes(index_quotes)
-            histories: dict[str, list[MarketCandle]] = {}
-            grains: dict[str, str] = {}
-            reload_history = (
-                desired_mode != self.us_chart_mode
-                or not self.us_history_loaded_at
-                or time.monotonic() - self.us_history_loaded_at >= 300
-            )
-            if reload_history:
-                with ThreadPoolExecutor(max_workers=len(US_CHART_NAMES)) as executor:
-                    futures = {}
-                    for name, symbol in US_INDEX_SYMBOLS.items():
-                        future = executor.submit(
-                            fetch_yahoo_candles,
-                            symbol,
-                            self.timeout,
-                            self.retries,
-                            self.history_limit,
-                            desired_mode == "intraday",
-                        )
-                        futures[future] = (name, "美股")
-                    for future in as_completed(futures):
-                        name, market_type = futures[future]
-                        try:
-                            candles, grain = future.result()
-                        except (OSError, RuntimeError, ValueError):
-                            histories[name] = []
-                            grains[name] = (
-                                "5 分 K（暫無資料）"
-                                if market_type == "美股"
-                                and desired_mode == "intraday"
-                                else "日 K（暫無資料）"
-                            )
-                        else:
-                            histories[name] = candles
-                            grains[name] = grain
+    def fetch_us_history(self, symbol, mode):
+        candles, grain = fetch_yahoo_candles(symbol, self.timeout, self.retries,
+                                             self.history_limit, mode == "intraday")
+        if not candles:
+            raise ValueError("K 線暫無資料")
+        return candles, grain, mode
 
-            self.result_queue.put(
-                (
-                    "us_data",
-                    (
-                        index_quotes,
-                        adr_quotes,
-                        stock_quotes,
-                        histories,
-                        grains,
-                        desired_mode,
-                        reload_history,
-                    ),
-                )
-            )
-        except Exception as exc:
-            self.result_queue.put(("error", exc))
+    def show_us_status(self):
+        if self.active_page != "us":
+            return
+        newest = max(self.us_index_rows.values(), key=lambda q: q.market_timestamp, default=None)
+        self.last_quote_status = f"美股指數行情時間：{newest.market_time if newest else '--'}"
+        self.last_quote_source = "Yahoo 股市批次報價／Yahoo Finance K 線"
+        errors = "、".join(k + (" K 線" if k in US_INDEX_SYMBOLS else "") for k in self.us_errors)
+        self.status_text.set(self.last_quote_status + ("｜未更新：" + errors if errors else ""))
+        self.source_text.set(f"來源：{self.last_quote_source}｜更新頻率：{self.interval} 秒")
+
+    def apply_us_section(self, section, payload, error):
+        self.us_pending.discard(section)
+        if not error:
+            if section in US_INDEX_SYMBOLS:
+                candles, grain, mode = payload
+                self.us_candles[section] = candles[-self.history_limit:]
+                self.us_candle_grains[section] = grain
+                self.us_history_loaded[section] = mode, time.monotonic()
+                self.us_chart_mode = mode
+                latest = self.us_index_rows.get(US_INDEX_SYMBOLS[section])
+                if latest and latest.market_timestamp >= candles[-1].timestamp:
+                    self.update_us_live_candle(section, latest)
+                self.draw_us_charts()
+            else:
+                cache, expected = {
+                    "指數": (self.us_index_rows, US_INDEX_SYMBOLS.values()),
+                    "ADR": (self.adr_rows, TAIWAN_ADR_SYMBOLS),
+                    "美國個股": (self.us_stock_rows, self.us_stock_symbols),
+                }[section]
+                updated = []
+                for q in payload:
+                    old = cache.get(q.symbol)
+                    if (q.symbol not in expected or q.price is None or not math.isfinite(q.price)
+                            or not q.market_timestamp or (old and q.market_timestamp < old.market_timestamp)):
+                        continue
+                    cache[q.symbol] = q
+                    updated.append(q)
+                if set(expected) - {q.symbol for q in updated}:
+                    error = "行情缺漏或過期"
+                if section == "指數":
+                    self.update_us_cards(updated)
+                elif updated:
+                    tree = self.adr_tree if section == "ADR" else self.us_stock_tree
+                    self.update_security_tree(tree, [cache[s] for s in expected if s in cache])
+        if error:
+            self.us_errors[section] = error
+        else:
+            self.us_errors.pop(section, None)
+        self.show_us_status()
 
     def process_results(self) -> None:
+        deadline = time.monotonic() + 0.012
         try:
-            while True:
+            while time.monotonic() < deadline:
                 kind, payload = self.result_queue.get_nowait()
+                if kind == "etf_preview":
+                    for row in payload:
+                        if row.price is not None:
+                            self.paint_etf_row(row)
+                    continue
+                if kind == "us_section":
+                    self.apply_us_section(*payload)
+                    continue
+                if kind == "tw_section":
+                    self.apply_tw_section(*payload)
+                    continue
+                if kind == "vix_history":
+                    market, rows = payload
+                    panel = self.vix_panels[market]
+                    if rows:
+                        panel.history = rows
+                    self.vix_history_due[market] = time.monotonic() + (1800 if len(rows) >= 60 else 120)
+                    panel.redraw()
+                    continue
+                if kind in ("tw_vix", "vix_close"):
+                    payload, points = payload
+                    match = re.search(r"([\d.]+) 點｜收盤(?:資料)? (\d{4}-\d\d-\d\d)", payload)
+                    close = (datetime.fromisoformat(match[2]).date(), float(match[1])) if match else None
+                    self.vix_panels["taiwan" if kind == "tw_vix" else "us"].update(points, close)
+                if kind == "tw_vix":
+                    self.tw_vix_next = time.monotonic() + (15 if "盤中" in payload else 60)
+                    self.tw_vix_last = payload or self.tw_vix_last
+                    note = "" if payload else "（更新失敗）"
+                    self.tw_vix_text.set(f"臺指 VIX｜期交所｜{self.tw_vix_last or '暫無資料'}{note}")
+                    continue
                 if kind == "vix_close":
                     self.vix_next_fetch = time.monotonic() + 15
                     self.vix_text.set(f"VIX 波動率指數｜{payload}")
                     continue
-                completed_page = self.loading_page
-                self.loading = False
-                self.loading_page = ""
-                if kind == "data":
-                    (
-                        quotes,
-                        api_time,
-                        data_source,
-                        etfs,
-                        taiwan_stocks,
-                        histories,
-                        grains,
-                        desired_mode,
-                    ) = payload
-                    self.update_market(
-                        quotes,
-                        api_time,
-                        data_source,
-                        etfs,
-                        taiwan_stocks,
-                        histories,
-                        grains,
-                        desired_mode,
-                    )
-                elif kind == "us_data":
-                    self.update_us_market(*payload)
-                else:
-                    self.status_text.set(f"更新失敗：{payload}")
-                delay = 0 if completed_page != self.active_page else self.interval * 1000
-                self.schedule_refresh(delay)
         except queue.Empty:
             pass
 
         if not self.closed:
-            self.root.after(200, self.process_results)
+            self.root.after(50 if self.result_queue.empty() else 1, self.process_results)
 
     def update_market(
         self,
         quotes: list[IndexQuote],
         api_time: str,
         data_source: str,
-        etfs: list[EtfMarketRow] | None,
-        taiwan_stocks: dict[str, SecurityQuote],
-        histories: dict[str, list[MarketCandle]] | None = None,
-        grains: dict[str, str] | None = None,
-        desired_mode: str | None = None,
     ) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.last_quote_status = f"本機時間：{now}｜行情時間：{api_time or '--'}"
         self.last_quote_source = data_source
-        self.status_text.set(f"本機時間：{now}｜行情時間：{api_time or '--'}")
-        self.source_text.set(f"來源：{data_source}｜更新頻率：{self.interval} 秒")
-
-        if histories is not None:
-            for name, candles in histories.items():
-                self.candles[name] = candles[-self.history_limit:]
-            self.candle_grains.update(grains or {})
-        if desired_mode:
-            self.chart_mode = desired_mode
+        if self.active_page == "taiwan":
+            self.source_text.set(f"來源：{data_source}｜更新頻率：{self.interval} 秒")
 
         market_date = api_time[:8] if len(api_time) >= 8 and api_time[:8].isdigit() else ""
         for quote in quotes:
@@ -3810,42 +4088,16 @@ class StockDynamicApp:
             )
             labels["time"].configure(text=f"時間 {quote.market_time}")
 
-        self.update_etfs(etfs)
-        self.update_taiwan_stocks(taiwan_stocks)
         self.draw_chart()
 
-    def update_us_market(
-        self,
-        index_quotes: list[SecurityQuote],
-        adr_quotes: list[SecurityQuote],
-        stock_quotes: list[SecurityQuote],
-        histories: dict[str, list[MarketCandle]],
-        grains: dict[str, str],
-        desired_mode: str,
-        history_reloaded: bool,
-    ) -> None:
-        available_times = [
-            quote.market_time
-            for quote in index_quotes
-            if quote.market_time != "--"
-        ]
-        market_time = max(available_times) if available_times else "--"
-        self.last_quote_status = f"美股行情時間：{market_time}"
-        self.last_quote_source = "Yahoo 股市批次報價／Yahoo Finance K 線"
-        self.us_index_rows = {quote.symbol: quote for quote in index_quotes}
-        self.adr_rows = {quote.symbol: quote for quote in adr_quotes}
-        self.us_stock_rows = {quote.symbol: quote for quote in stock_quotes}
-        if history_reloaded:
-            for name in US_CHART_NAMES:
-                self.us_candles[name] = histories.get(name, [])[-self.history_limit:]
-            self.us_candle_grains.update(grains)
-            self.us_history_loaded_at = time.monotonic()
-        self.us_chart_mode = desired_mode
+    def update_us_cards(self, index_quotes):
 
         for quote in index_quotes:
             self.us_previous_close[quote.name] = quote.previous_close
-            if quote.price is not None:
-                self.update_us_live_candle(quote.name, quote)
+            if self.us_history_loaded.get(quote.name):
+                candles = self.us_candles[quote.name]
+                if candles and quote.market_timestamp >= candles[-1].timestamp:
+                    self.update_us_live_candle(quote.name, quote)
             labels = self.us_cards.get(quote.name)
             if not labels:
                 continue
@@ -3859,15 +4111,6 @@ class StockDynamicApp:
             )
             labels["time"].configure(text=f"時間 {quote.market_time}")
 
-        self.update_security_tree(self.adr_tree, adr_quotes)
-        self.update_security_tree(self.us_stock_tree, stock_quotes)
-        mode_text = "盤中 5 分 K" if desired_mode == "intraday" else "日 K"
-        self.status_text.set(
-            f"美股行情時間：{market_time}｜K 線模式：{mode_text}"
-        )
-        self.source_text.set(
-            f"來源：Yahoo 股市批次報價／Yahoo Finance K 線｜更新頻率：{self.interval} 秒"
-        )
         self.draw_us_charts()
 
     def update_security_tree(
@@ -3875,7 +4118,6 @@ class StockDynamicApp:
         tree: ttk.Treeview,
         quotes: list[SecurityQuote],
     ) -> None:
-        trim_quote_rows(tree, (quote.symbol for quote in quotes))
         for quote in quotes:
             update_quote_row(
                 tree, quote.symbol,
@@ -3960,6 +4202,10 @@ class StockDynamicApp:
     def update_live_candle(self, quote: IndexQuote, market_date: str) -> None:
         if quote.price is None:
             return
+        try:
+            moment = datetime.strptime(f"{market_date} {quote.market_time}", "%Y%m%d %H:%M:%S")
+        except ValueError:
+            return
         candles = self.candles[quote.name]
         grain = self.candle_grains.get(quote.name, "即時 K")
         if grain.startswith("日 K"):
@@ -3972,7 +4218,7 @@ class StockDynamicApp:
             high_value = quote.high or max(open_value, quote.price)
             low_value = quote.low or min(open_value, quote.price)
             live = MarketCandle(
-                int(datetime.now().timestamp()),
+                int(moment.timestamp()),
                 label,
                 open_value,
                 max(high_value, open_value, quote.price),
@@ -3984,7 +4230,7 @@ class StockDynamicApp:
             else:
                 candles.append(live)
         else:
-            now = datetime.now()
+            now = moment
             interval_match = re.search(r"(\d+)\s*分", grain)
             interval_minutes = int(interval_match.group(1)) if interval_match else 5
             minute = now.minute - now.minute % interval_minutes
@@ -4018,7 +4264,7 @@ class StockDynamicApp:
         self,
         stocks: dict[str, SecurityQuote],
     ) -> None:
-        trim_quote_rows(self.tw_stock_tree, stocks.keys() & self.tw_stock_symbols.keys())
+        trim_quote_rows(self.tw_stock_tree, self.tw_stock_symbols)
         self.tw_stock_rows = dict(stocks)
         for code in self.tw_stock_symbols:
             quote = stocks.get(code)
@@ -4070,8 +4316,13 @@ class StockDynamicApp:
         if not etfs:
             return
         for position, etf in enumerate(etfs):
-            self.etf_rows[etf.code] = etf
-            update_quote_row(
+            self.paint_etf_row(etf)
+            if self.etf_tree.index(etf.code) != position:
+                self.etf_tree.move(etf.code, "", position)
+
+    def paint_etf_row(self, etf):
+        self.etf_rows[etf.code] = etf
+        update_quote_row(
                 self.etf_tree, etf.code,
                 values=(
                     etf.code,
@@ -4086,8 +4337,6 @@ class StockDynamicApp:
                 ),
                 tag=movement_tag(etf.change),
             )
-            if self.etf_tree.index(etf.code) != position:
-                self.etf_tree.move(etf.code, "", position)
 
     def open_selected_etf(self, _event: tk.Event) -> None:
         selection = self.etf_tree.selection()
@@ -4336,8 +4585,7 @@ class TaiwanFuturesWindow:
 
         self.window = tk.Toplevel(parent)
         self.window.title("台指近月期貨｜四大指數")
-        self.window.geometry("1040x720")
-        self.window.minsize(760, 560)
+        fit_window(self.window, (1040, 720), (640, 480))
         self.window.protocol("WM_DELETE_WINDOW", self.close)
 
         self.status_text = tk.StringVar(value="正在載入 Yahoo 台灣期貨行情...")
@@ -4645,8 +4893,7 @@ class MarketOverviewWindow:
 
         self.window = tk.Toplevel(parent)
         self.window.title("市場籌碼 Dashboard｜上市、上櫃與三大法人")
-        self.window.geometry("1280x900")
-        self.window.minsize(680, 520)
+        fit_window(self.window, (1280, 900), (560, 440))
         try:
             self.window.state("zoomed")
         except tk.TclError:
@@ -4866,6 +5113,7 @@ class MarketOverviewWindow:
         self.scroll_canvas.yview_scroll(-int(event.delta / 120), "units")
 
     def layout_dashboard_for_width(self, width: int) -> None:
+        width = round(width / display_scale(self.window))
         layout_width = 680 if width < 760 else 800 if width < 850 else 1000 if width < 1100 else 1280
         if self.market_layout_width == layout_width:
             return
@@ -4960,7 +5208,7 @@ class MarketOverviewWindow:
             return
         self.window.update_idletasks()
         available = self.dashboard_pane.winfo_height()
-        stacked = self.scroll_canvas.winfo_width() < 850
+        stacked = self.scroll_canvas.winfo_width() / display_scale(self.window) < 850
         breadth_min = 520 if stacked else 245
         institution_min = 620 if stacked else 380
         breadth_height = max(
@@ -5398,8 +5646,7 @@ class EtfDetailWindow:
 
         self.window = tk.Toplevel(parent)
         self.window.title(f"{initial.code} {initial.name}")
-        self.window.geometry("760x560")
-        self.window.minsize(520, 420)
+        fit_window(self.window, (760, 560), (520, 420))
         self.window.protocol("WM_DELETE_WINDOW", self.close)
 
         self.title_text = tk.StringVar(value=f"{initial.code}  {initial.name}")
@@ -5454,6 +5701,7 @@ class EtfDetailWindow:
             self.layout_for_width(event.width)
 
     def layout_for_width(self, width: int) -> None:
+        width = round(width / display_scale(self.window))
         stacked = width < 620
         if self.detail_layout_stacked == stacked:
             return
