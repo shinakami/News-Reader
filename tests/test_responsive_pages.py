@@ -4,13 +4,41 @@ import tkinter as tk
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-from news_reader.stock_dynamic import StockDynamicApp, update_quote_row, movement_tag
+from news_reader.stock_dynamic import StockDynamicApp, MarketOverviewWindow, THEMES, update_quote_row, movement_tag
 
 
 class ResponsivePages(unittest.TestCase):
+    def test_market_bar_labels_clear_bars_on_compact_high_dpi_canvas(self):
+        root = tk.Tk()
+        self.addCleanup(root.destroy)
+        previous = root.tk.call("tk", "scaling")
+        self.addCleanup(root.tk.call, "tk", "scaling", previous)
+        root.tk.call("tk", "scaling", 2.0)
+        canvas = tk.Canvas(root, width=340, height=165, highlightthickness=0)
+        canvas.pack()
+        root.update()
+        view = MarketOverviewWindow.__new__(MarketOverviewWindow)
+        view.theme_getter = lambda: THEMES["night"]
+        view.breadth = None
+        view.institution_flow_canvas = view.institution_net_canvas = canvas
+        view.institutions = SimpleNamespace(rows=[
+            SimpleNamespace(name="外資", buy_amount=123400000000, sell_amount=123300000000, net_amount=100000000),
+            SimpleNamespace(name="投信", buy_amount=0, sell_amount=999900000000, net_amount=-999900000000)])
+        for draw in (lambda: view.draw_market_breadth_chart(canvas, "上市", "20261126", 1234, 2, 0, 3, 1),
+                     view.draw_institution_flow_chart, view.draw_institution_net_chart):
+            draw()
+            for item in canvas.find_all():
+                if canvas.type(item) != "text":
+                    continue
+                l,t,r,b = canvas.bbox(item)
+                self.assertTrue(0 <= l < r <= canvas.winfo_width() and 0 <= t < b <= canvas.winfo_height())
+                overlaps = canvas.find_overlapping(l,t,r,b)
+                self.assertFalse(any(canvas.type(i) == "rectangle" and i != canvas.find_all()[0] for i in overlaps))
+
     def test_high_dpi_compact_menu_and_readable_table(self):
         try:
             root = tk.Tk()

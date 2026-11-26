@@ -15,6 +15,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+from tkinter import font as tkfont
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -5381,8 +5382,9 @@ class MarketOverviewWindow:
     ) -> None:
         canvas.delete("all")
         theme = self.theme_getter()
-        width = max(canvas.winfo_width(), 420)
-        height = max(canvas.winfo_height(), 220)
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if min(width, height) <= 1:
+            return
         canvas.create_rectangle(
             1,
             1,
@@ -5420,9 +5422,11 @@ class MarketOverviewWindow:
             )
             return
 
-        left, right, top, bottom = 42, 18, 50, 55
+        value_font = ("Segoe UI", 12, "bold")
+        line = tkfont.Font(root=canvas, font=value_font).metrics("linespace")
+        left, right, top, bottom = 18, 18, 22 + 2 * line, max(55, 2 * line + 8)
         plot_width = width - left - right
-        plot_height = height - top - bottom
+        plot_height = max(0, height - top - bottom)
         totals = (up, flat, down)
         labels = ("上漲", "持平", "下跌")
         colors = (theme["up"], theme["muted"], theme["down"])
@@ -5449,10 +5453,10 @@ class MarketOverviewWindow:
             )
             canvas.create_text(
                 center_x,
-                max(top + 10, y0 - 10),
+                y0 - 3, anchor="s",
                 text=f"{count:,}",
                 fill=color,
-                font=("Segoe UI", 12, "bold"),
+                font=value_font,
             )
             canvas.create_text(
                 center_x,
@@ -5484,8 +5488,9 @@ class MarketOverviewWindow:
         canvas = self.institution_flow_canvas
         canvas.delete("all")
         theme = self.theme_getter()
-        width = max(canvas.winfo_width(), 520)
-        height = max(canvas.winfo_height(), 180)
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if min(width, height) <= 1:
+            return
         canvas.create_rectangle(
             1, 1, width - 2, height - 2,
             fill=theme["surface_alt"], outline=theme["line"],
@@ -5515,8 +5520,10 @@ class MarketOverviewWindow:
             for amount in (row.buy_amount, row.sell_amount)
         ]
         maximum = max(values) or 1
-        left, right, top, bottom = 44, 18, 42, 38
-        plot_height = height - top - bottom
+        value_font = ("Segoe UI", 8, "bold")
+        line = tkfont.Font(root=canvas, font=value_font).metrics("linespace")
+        left, right, top, bottom = 12, 12, 26 + 2 * line, max(32, line + 12)
+        plot_height = max(0, height - top - bottom)
         group_width = (width - left - right) / len(rows)
         bar_width = min(34, group_width * 0.25)
         for grid_index in range(4):
@@ -5537,11 +5544,11 @@ class MarketOverviewWindow:
                     fill=color, outline="",
                 )
                 canvas.create_text(
-                    x0 + bar_width / 2,
-                    max(top + 7, y0 - 7),
+                    center + (-2 if offset < 0 else 2),
+                    y0 - 3, anchor="se" if offset < 0 else "sw",
                     text=f"{value:,.0f}",
                     fill=color,
-                    font=("Segoe UI", 7, "bold"),
+                    font=value_font,
                 )
             canvas.create_text(
                 center, height - 18,
@@ -5554,8 +5561,9 @@ class MarketOverviewWindow:
         canvas = self.institution_net_canvas
         canvas.delete("all")
         theme = self.theme_getter()
-        width = max(canvas.winfo_width(), 380)
-        height = max(canvas.winfo_height(), 180)
+        width, height = canvas.winfo_width(), canvas.winfo_height()
+        if min(width, height) <= 1:
+            return
         canvas.create_rectangle(
             1, 1, width - 2, height - 2,
             fill=theme["surface_alt"], outline=theme["line"],
@@ -5577,7 +5585,10 @@ class MarketOverviewWindow:
                 fill=theme["muted"], font=("Microsoft JhengHei UI", 10),
             )
             return
-        left, right, top, bottom = 82, 28, 42, 18
+        value_font = ("Segoe UI", 8, "bold")
+        measure = tkfont.Font(root=canvas, font=value_font).measure
+        right = 20 + max(measure(fmt_signed(row.net_amount / 100_000_000)) for row in rows)
+        left, top, bottom = 82, 42, 18
         center = left + (width - left - right) / 2
         half_width = (width - left - right) / 2
         maximum = max(abs(row.net_amount / 100_000_000) for row in rows) or 1
@@ -5602,11 +5613,9 @@ class MarketOverviewWindow:
                 font=("Microsoft JhengHei UI", 8, "bold"),
             )
             canvas.create_rectangle(x0, y - 8, x1, y + 8, fill=color, outline="")
-            label_x = min(width - 8, x1 + 5) if value >= 0 else max(left + 5, x0 - 5)
             canvas.create_text(
-                label_x, y, text=fmt_signed(value), fill=color,
-                anchor="w" if value >= 0 else "e",
-                font=("Segoe UI", 8, "bold"),
+                width - 8, y, text=fmt_signed(value), fill=color,
+                anchor="e", font=value_font,
             )
 
     def draw_breadth_chart(self) -> None:
